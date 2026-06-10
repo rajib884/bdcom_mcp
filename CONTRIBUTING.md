@@ -5,9 +5,8 @@ Thank you for your interest in contributing to the Cisco MCP Server! This docume
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Node.js 14.0.0 or higher
-- npm or yarn
-- TypeScript knowledge
+- Python 3.10 or higher
+- pip / venv
 - Basic understanding of Cisco networking
 - Familiarity with SSH/Telnet protocols
 
@@ -19,48 +18,45 @@ Thank you for your interest in contributing to the Cisco MCP Server! This docume
    cd cisco-mcp
    ```
 
-2. **Install Dependencies**
+2. **Create a Virtual Environment and Install**
    ```bash
-   npm install
+   python -m venv .venv
+   # Windows:  .venv\Scripts\activate
+   # macOS/Linux:  source .venv/bin/activate
+   pip install -e .
    ```
 
-3. **Development Mode**
+3. **Run the Server**
    ```bash
-   npm run dev
-   ```
-
-4. **Build Project**
-   ```bash
-   npm run build
+   python -m cisco_mcp.server
    ```
 
 ## 🛠 Development Guidelines
 
 ### Code Style
-- Use TypeScript for all source code
-- Follow existing code formatting and structure
+- Use type hints throughout the Python source
+- Follow existing code formatting and structure (PEP 8)
 - Use meaningful variable and function names
-- Add JSDoc comments for public methods
+- Add docstrings for public functions and methods
 - Maintain consistency with existing codebase
 
 ### Project Structure
 ```
-src/
-├── index.ts              # Main MCP server entry point
-├── cisco-connection.ts   # Connection management logic
-└── types/               # TypeScript type definitions
+cisco_mcp/
+├── __init__.py        # Package exports
+├── server.py          # FastMCP server + tool definitions
+└── connection.py      # CiscoConnectionManager (netmiko transport)
 ```
 
 ### Adding New Features
 
-1. **New Tools**: Add new MCP tools in `src/index.ts`
-2. **Connection Logic**: Extend `CiscoConnectionManager` in `src/cisco-connection.ts`
-3. **Types**: Add new TypeScript interfaces in appropriate files
+1. **New Tools**: Add new `@mcp.tool` functions in `cisco_mcp/server.py`
+2. **Connection Logic**: Extend `CiscoConnectionManager` in `cisco_mcp/connection.py`
 
 ## 🧪 Testing
 
 ### Manual Testing
-1. Build the project: `npm run build`
+1. Run the offline smoke test: `python smoke_test.py`
 2. Test with a real Cisco device or simulator
 3. Verify all connection types (SSH/Telnet)
 4. Test different command modes (user/enable/config)
@@ -90,7 +86,7 @@ src/
 1. Check existing issues for duplicates
 2. Test with the latest version
 3. Gather relevant information:
-   - Node.js version
+   - Python version
    - Cisco device type and IOS version
    - Connection method (SSH/Telnet)
    - Error messages and logs
@@ -110,7 +106,7 @@ Steps to reproduce the behavior:
 What you expected to happen.
 
 **Environment**
-- Node.js version:
+- Python version:
 - Cisco device model:
 - IOS version:
 - Connection method:

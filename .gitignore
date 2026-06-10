@@ -5,9 +5,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # Build outputs
-dist/
 build/
-*.tsbuildinfo
 
 # Environment variables
 .env
@@ -88,3 +86,14 @@ jspm_packages/
 
 # DynamoDB Local files
 .dynamodb/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

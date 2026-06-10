@@ -18,33 +18,45 @@ A comprehensive MCP (Model Context Protocol) server for Cisco device management 
 - **🤖 AI-Friendly**: Natural language command translation through AI assistants
 - **📊 Connection Monitoring**: Track active connections and their status
 
+> **Implementation:** This is the Python / [FastMCP](https://github.com/jlowin/fastmcp)
+> server. SSH/Telnet transport is handled by [netmiko](https://github.com/ktbyers/netmiko),
+> which is purpose-built for network devices (robust prompt detection, paging,
+> and user/enable/config mode handling).
+
 ### 🚀 Quick Start
 
 1. **Clone and Install**
    ```bash
    git clone https://github.com/very99/cisco-mcp.git
    cd cisco-mcp
-   npm install
+   python -m venv .venv
+   # Windows:  .venv\Scripts\activate
+   # macOS/Linux:  source .venv/bin/activate
+   pip install -e .          # or: pip install -r requirements.txt
    ```
 
-2. **Build the Project**
+2. **Run / Verify**
    ```bash
-   npm run build
+   python -m cisco_mcp.server   # serves over stdio
    ```
 
 3. **Configure MCP Client**
-   
-   Add to your MCP configuration (e.g., Claude Desktop):
+
+   Add to your MCP configuration (e.g., Claude Desktop). Use the Python
+   interpreter from the virtual environment you created above:
    ```json
    {
      "mcpServers": {
        "cisco-mcp": {
-         "command": "node",
-         "args": ["/path/to/cisco-mcp/dist/index.js"]
+         "command": "/path/to/cisco-mcp/.venv/bin/python",
+         "args": ["-m", "cisco_mcp.server"]
        }
      }
    }
    ```
+   On Windows, use `\path\to\cisco-mcp\.venv\Scripts\python.exe`. If you
+   installed the package (`pip install -e .`), you can instead point `command`
+   at the generated `cisco-mcp` executable with no `args`.
 
 ### 🛠 Available Tools
 
@@ -204,27 +216,31 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
    ```bash
    git clone https://github.com/very99/cisco-mcp.git
    cd cisco-mcp
-   npm install
+   python -m venv .venv
+   # Windows:  .venv\Scripts\activate
+   # macOS/Linux:  source .venv/bin/activate
+   pip install -e .          # 或: pip install -r requirements.txt
    ```
 
-2. **构建项目**
+2. **运行 / 验证**
    ```bash
-   npm run build
+   python -m cisco_mcp.server   # 通过 stdio 提供服务
    ```
 
 3. **配置MCP客户端**
-   
-   添加到您的MCP配置中（例如Claude Desktop）：
+
+   添加到您的MCP配置中（例如Claude Desktop），使用上面创建的虚拟环境中的 Python 解释器：
    ```json
    {
      "mcpServers": {
        "cisco-mcp": {
-         "command": "node",
-         "args": ["/path/to/cisco-mcp/dist/index.js"]
+         "command": "/path/to/cisco-mcp/.venv/bin/python",
+         "args": ["-m", "cisco_mcp.server"]
        }
      }
    }
    ```
+   Windows 请使用 `\path\to\cisco-mcp\.venv\Scripts\python.exe`。
 
 ### 🛠 可用工具
 
