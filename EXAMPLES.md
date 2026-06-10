@@ -1,17 +1,33 @@
-# Cisco MCP Server - Usage Examples
+# Device MCP Server - Usage Examples
 
 ## Basic Connection and Commands
 
-### 1. Connect to a Cisco Device
+### 1. Connect to a Device
 
+Cisco IOS (default `device_type`):
 ```json
 {
-  "tool": "connect_cisco_device",
+  "tool": "connect_device",
   "arguments": {
     "host": "192.168.1.1",
     "username": "admin",
-    "password": "cisco123",
+    "password": "secret123",
+    "device_type": "cisco_ios",
     "protocol": "ssh",
+    "enable_password": "enable123"
+  }
+}
+```
+
+BDCOM switch:
+```json
+{
+  "tool": "connect_device",
+  "arguments": {
+    "host": "192.168.1.2",
+    "username": "admin",
+    "password": "secret123",
+    "device_type": "bdcom",
     "enable_password": "enable123"
   }
 }
@@ -21,7 +37,7 @@
 
 ```json
 {
-  "tool": "execute_cisco_command",
+  "tool": "execute_command",
   "arguments": {
     "host": "192.168.1.1",
     "command": "show version",
@@ -32,7 +48,7 @@
 
 ```json
 {
-  "tool": "execute_cisco_command",
+  "tool": "execute_command",
   "arguments": {
     "host": "192.168.1.1",
     "command": "show ip interface brief",
@@ -45,7 +61,7 @@
 
 ```json
 {
-  "tool": "execute_cisco_command",
+  "tool": "execute_command",
   "arguments": {
     "host": "192.168.1.1",
     "command": "interface GigabitEthernet0/1",
@@ -56,7 +72,7 @@
 
 ```json
 {
-  "tool": "execute_cisco_command",
+  "tool": "execute_command",
   "arguments": {
     "host": "192.168.1.1",
     "command": "ip address 10.1.1.1 255.255.255.0",
@@ -64,6 +80,9 @@
   }
 }
 ```
+
+> The server enters the right mode automatically (e.g. `config` runs
+> `configure terminal` on Cisco IOS and `config` on BDCOM).
 
 ## Natural Language Examples for AI Assistants
 
@@ -77,13 +96,12 @@
 4. Execute: `ping 8.8.8.8`
 
 ### Device Information
-**User**: "Get detailed information about the Cisco switch at 10.0.0.1"
+**User**: "Get detailed information about the switch at 10.0.0.1"
 
 **AI Assistant will**:
 1. Connect to the device
 2. Execute: `show version`
 3. Execute: `show inventory`
-4. Execute: `show system`
 
 ### VLAN Configuration
 **User**: "Create VLAN 100 named 'Sales' on the switch"
@@ -105,10 +123,13 @@
 5. Execute: `switchport mode access`
 6. Execute: `switchport access vlan 10`
 
-## Common Cisco Commands Reference
+## Common Commands Reference (Cisco IOS / BDCOM)
+
+These are widely supported across Cisco IOS and BDCOM. The server forwards any
+command the device accepts, so vendor-specific commands work too.
 
 ### Show Commands
-- `show version` - Device information and IOS version
+- `show version` - Device information and OS version
 - `show running-config` - Current running configuration
 - `show startup-config` - Startup configuration
 - `show ip interface brief` - IP interface summary
@@ -117,29 +138,28 @@
 - `show ip route` - Routing table
 - `show arp` - ARP table
 - `show mac address-table` - MAC address table
-- `show cdp neighbors` - CDP neighbor information
 - `show inventory` - Hardware inventory
 - `show processes cpu` - CPU utilization
 - `show memory` - Memory utilization
 
 ### Configuration Commands
-- `configure terminal` - Enter global configuration mode
 - `interface <interface-name>` - Enter interface configuration
 - `ip address <ip> <mask>` - Set IP address
-- `no shutdown` - Enable interface
-- `shutdown` - Disable interface
+- `no shutdown` / `shutdown` - Enable / disable interface
 - `description <text>` - Set interface description
 - `vlan <vlan-id>` - Create or enter VLAN configuration
 - `name <vlan-name>` - Set VLAN name
 - `switchport mode access` - Set port to access mode
 - `switchport access vlan <vlan-id>` - Assign port to VLAN
 
+> Note: enter config mode via `mode: "config"`. The server issues the right
+> mode-entry command per platform (`configure terminal` on Cisco, `config` on BDCOM).
+
 ### Diagnostic Commands
 - `ping <destination>` - Test connectivity
 - `traceroute <destination>` - Trace network path
 - `show tech-support` - Comprehensive diagnostic information
-- `show log` - System log messages
-- `debug <protocol>` - Enable debugging (use with caution)
+- `show logging` - System log messages
 
 ## Multi-Device Management
 
@@ -151,12 +171,12 @@
 }
 ```
 
-This will show all active connections and their status.
+This shows all active connections (host, device_type, protocol, current mode, timestamps).
 
 ### Disconnect from Device
 ```json
 {
-  "tool": "disconnect_cisco_device",
+  "tool": "disconnect_device",
   "arguments": {
     "host": "192.168.1.1"
   }
@@ -170,6 +190,6 @@ The MCP server provides detailed error messages for:
 - Authentication errors
 - Command execution errors
 - Network timeouts
-- Invalid commands
+- Unsupported `device_type` values
 
 All errors are returned in a structured format for easy parsing by AI assistants.

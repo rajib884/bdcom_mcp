@@ -1,9 +1,10 @@
-"""Persistent SSH/Telnet connection management for Cisco devices.
+"""Persistent SSH/Telnet connection management for network devices.
 
-This is the Python port of the original TypeScript ``CiscoConnectionManager``.
-It uses `netmiko <https://github.com/ktbyers/netmiko>`_ as the transport, which
-is purpose-built for network devices and handles prompt detection, paging
-("--More--"), and user/enable/config mode transitions reliably.
+Uses `netmiko <https://github.com/ktbyers/netmiko>`_ as the transport, which is
+purpose-built for network devices and handles prompt detection, paging
+("--More--"), and user/enable/config mode transitions. BDCOM devices are driven
+by a small custom driver (see :mod:`device_mcp.bdcom`); Cisco IOS and any other
+netmiko platform go through the standard dispatcher.
 """
 
 from __future__ import annotations
@@ -13,11 +14,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+import netmiko
 from netmiko import ConnectHandler
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
 )
+
+from .bdcom import BdcomSSH, BdcomTelnet
 
 Protocol = Literal["ssh", "telnet"]
 Mode = Literal["user", "enable", "config"]
@@ -27,28 +31,57 @@ Mode = Literal["user", "enable", "config"]
 _EXEC_READ_TIMEOUT = 60.0
 _CONFIG_READ_TIMEOUT = 60.0
 
+# device_type values served by a custom driver class instead of netmiko's
+# dispatcher. Maps key -> (ssh_class, telnet_class).
+_CUSTOM_DRIVERS: dict[str, tuple[type, type]] = {
+    "bdcom": (BdcomSSH, BdcomTelnet),
+}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def resolve_platform(device_type: str, protocol: Protocol) -> tuple[str, Any]:
+    """Resolve ``(device_type, protocol)`` to a connection strategy.
+
+    Returns one of:
+      * ``("class", <netmiko subclass>)``  - instantiate the class directly
+      * ``("netmiko", <device_type str>)`` - pass to ``ConnectHandler``
+
+    Raises :class:`ValueError` for an unknown netmiko ``device_type``. Pure and
+    side-effect-free so it can be unit-tested without any network I/O.
+    """
+    key = device_type.lower()
+    if key in _CUSTOM_DRIVERS:
+        ssh_cls, telnet_cls = _CUSTOM_DRIVERS[key]
+        return ("class", telnet_cls if protocol == "telnet" else ssh_cls)
+
+    effective = device_type
+    if protocol == "telnet" and not effective.endswith("_telnet"):
+        effective = f"{effective}_telnet"
+    if effective not in netmiko.platforms:
+        raise ValueError(f"Unsupported device_type '{effective}'")
+    return ("netmiko", effective)
+
+
 @dataclass
-class CiscoConnection:
+class DeviceConnection:
     """A single live connection plus its metadata."""
 
     config: dict[str, Any]
-    connection: Any  # netmiko BaseConnection
+    connection: Any  # netmiko BaseConnection (or a custom subclass)
     connected: bool = True
     connected_at: datetime = field(default_factory=_now)
     last_activity: datetime = field(default_factory=_now)
     current_mode: Mode = "user"
 
 
-class CiscoConnectionManager:
-    """Manage long-lived connections to multiple Cisco devices, keyed by host."""
+class DeviceConnectionManager:
+    """Manage long-lived connections to multiple network devices, keyed by host."""
 
     def __init__(self) -> None:
-        self._connections: dict[str, CiscoConnection] = {}
+        self._connections: dict[str, DeviceConnection] = {}
         # FastMCP may dispatch tool calls from multiple worker threads, so guard
         # the shared connection map and the (non-reentrant) netmiko channels.
         self._lock = threading.RLock()
@@ -59,6 +92,7 @@ class CiscoConnectionManager:
         host: str,
         username: str,
         password: str,
+        device_type: str = "cisco_ios",
         protocol: Protocol = "ssh",
         port: int | None = None,
         enable_password: str | None = None,
@@ -72,9 +106,12 @@ class CiscoConnectionManager:
                     "host": host,
                 }
 
-            device_type = "cisco_ios" if protocol == "ssh" else "cisco_ios_telnet"
+            try:
+                strategy, target = resolve_platform(device_type, protocol)
+            except ValueError as exc:
+                return self._failure(host, str(exc))
+
             params: dict[str, Any] = {
-                "device_type": device_type,
                 "host": host,
                 "username": username,
                 "password": password,
@@ -86,7 +123,10 @@ class CiscoConnectionManager:
                 params["secret"] = enable_password
 
             try:
-                connection = ConnectHandler(**params)
+                if strategy == "class":
+                    connection = target(**params)
+                else:
+                    connection = ConnectHandler(device_type=target, **params)
             except NetmikoAuthenticationException as exc:
                 return self._failure(host, f"Authentication failed: {exc}")
             except NetmikoTimeoutException as exc:
@@ -94,9 +134,10 @@ class CiscoConnectionManager:
             except Exception as exc:  # noqa: BLE001 - surface any transport error
                 return self._failure(host, f"{type(exc).__name__}: {exc}")
 
-            self._connections[host] = CiscoConnection(
+            self._connections[host] = DeviceConnection(
                 config={
                     "host": host,
+                    "device_type": device_type,
                     "protocol": protocol,
                     "enable_password": enable_password,
                 },
@@ -104,7 +145,10 @@ class CiscoConnectionManager:
             )
             return {
                 "success": True,
-                "message": f"Successfully connected to {host} via {protocol.upper()}",
+                "message": (
+                    f"Successfully connected to {host} ({device_type}) "
+                    f"via {protocol.upper()}"
+                ),
                 "host": host,
             }
 
@@ -135,7 +179,7 @@ class CiscoConnectionManager:
             return output
 
     # ------------------------------------------------------------- mode switching
-    def _switch_mode(self, conn: CiscoConnection, target: Mode) -> None:
+    def _switch_mode(self, conn: DeviceConnection, target: Mode) -> None:
         net = conn.connection
         enable_password = conn.config.get("enable_password")
 
@@ -188,6 +232,7 @@ class CiscoConnectionManager:
             return [
                 {
                     "host": host,
+                    "device_type": conn.config.get("device_type"),
                     "protocol": conn.config.get("protocol"),
                     "connected": conn.connected,
                     "current_mode": conn.current_mode,

@@ -1,11 +1,11 @@
-"""Cisco MCP Server (Python / FastMCP).
+"""Device MCP Server (Python / FastMCP).
 
-A FastMCP port of the original TypeScript Cisco MCP server. Exposes four tools
-for managing Cisco routers, switches, and firewalls over SSH or Telnet:
+A FastMCP server for managing network devices (Cisco IOS, BDCOM, and any other
+netmiko-supported platform) over SSH or Telnet. Exposes four tools:
 
-    * connect_cisco_device
-    * execute_cisco_command
-    * disconnect_cisco_device
+    * connect_device
+    * execute_command
+    * disconnect_device
     * list_connections
 """
 
@@ -17,10 +17,10 @@ from typing import Annotated, Literal, Optional
 from fastmcp import FastMCP
 from pydantic import Field
 
-from .connection import CiscoConnectionManager
+from .connection import DeviceConnectionManager
 
-mcp = FastMCP("cisco-mcp")
-_manager = CiscoConnectionManager()
+mcp = FastMCP("device-mcp")
+_manager = DeviceConnectionManager()
 
 
 def _json(payload: object) -> str:
@@ -28,10 +28,18 @@ def _json(payload: object) -> str:
 
 
 @mcp.tool
-def connect_cisco_device(
-    host: Annotated[str, Field(description="IP address or hostname of the Cisco device")],
+def connect_device(
+    host: Annotated[str, Field(description="IP address or hostname of the device")],
     username: Annotated[str, Field(description="Username for authentication")],
     password: Annotated[str, Field(description="Password for authentication")],
+    device_type: Annotated[
+        str,
+        Field(
+            description="Platform driver: 'cisco_ios' (default), 'bdcom', or any "
+            "netmiko device_type (e.g. cisco_xe, cisco_nxos, arista_eos). BDCOM "
+            "switches must use 'bdcom'."
+        ),
+    ] = "cisco_ios",
     protocol: Annotated[
         Literal["ssh", "telnet"],
         Field(description="Connection protocol (ssh or telnet)"),
@@ -45,7 +53,7 @@ def connect_cisco_device(
         Field(description="Enable password for privileged mode (optional)"),
     ] = None,
 ) -> str:
-    """Connect to a Cisco device via SSH or Telnet.
+    """Connect to a network device via SSH or Telnet.
 
     Establishes a persistent connection for command execution.
     """
@@ -53,6 +61,7 @@ def connect_cisco_device(
         host=host,
         username=username,
         password=password,
+        device_type=device_type,
         protocol=protocol,
         port=port,
         enable_password=enable_password,
@@ -61,14 +70,14 @@ def connect_cisco_device(
 
 
 @mcp.tool
-def execute_cisco_command(
+def execute_command(
     host: Annotated[
-        str, Field(description="IP address or hostname of the connected Cisco device")
+        str, Field(description="IP address or hostname of the connected device")
     ],
     command: Annotated[
         str,
         Field(
-            description='Cisco command to execute (e.g., "show version", '
+            description='Command to execute (e.g., "show version", '
             '"show ip interface brief")'
         ),
     ],
@@ -80,9 +89,9 @@ def execute_cisco_command(
         ),
     ] = "user",
 ) -> str:
-    """Execute a command on a connected Cisco device.
+    """Execute a command on a connected network device.
 
-    The device must be connected first using ``connect_cisco_device``.
+    The device must be connected first using ``connect_device``.
     """
     try:
         return _manager.execute_command(host, command, mode)
@@ -91,19 +100,19 @@ def execute_cisco_command(
 
 
 @mcp.tool
-def disconnect_cisco_device(
+def disconnect_device(
     host: Annotated[
         str,
-        Field(description="IP address or hostname of the Cisco device to disconnect"),
+        Field(description="IP address or hostname of the device to disconnect"),
     ],
 ) -> str:
-    """Disconnect from a Cisco device and clean up the connection."""
+    """Disconnect from a network device and clean up the connection."""
     return _json(_manager.disconnect(host))
 
 
 @mcp.tool
 def list_connections() -> str:
-    """List all active Cisco device connections."""
+    """List all active network device connections."""
     return _json(_manager.list_connections())
 
 

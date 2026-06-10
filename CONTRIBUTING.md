@@ -1,21 +1,21 @@
-# Contributing to Cisco MCP Server
+# Contributing to Device MCP Server
 
-Thank you for your interest in contributing to the Cisco MCP Server! This document provides guidelines and information for contributors.
+Thank you for your interest in contributing to the Device MCP Server! This document provides guidelines and information for contributors.
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 - Python 3.10 or higher
 - pip / venv
-- Basic understanding of Cisco networking
+- Basic understanding of network device CLIs (Cisco IOS, BDCOM, etc.)
 - Familiarity with SSH/Telnet protocols
 
 ### Development Setup
 
 1. **Fork and Clone**
    ```bash
-   git clone https://github.com/your-username/cisco-mcp.git
-   cd cisco-mcp
+   git clone https://github.com/your-username/cisco-mcp.git device-mcp
+   cd device-mcp
    ```
 
 2. **Create a Virtual Environment and Install**
@@ -28,7 +28,7 @@ Thank you for your interest in contributing to the Cisco MCP Server! This docume
 
 3. **Run the Server**
    ```bash
-   python -m cisco_mcp.server
+   python -m device_mcp.server
    ```
 
 ## 🛠 Development Guidelines
@@ -42,22 +42,25 @@ Thank you for your interest in contributing to the Cisco MCP Server! This docume
 
 ### Project Structure
 ```
-cisco_mcp/
+device_mcp/
 ├── __init__.py        # Package exports
 ├── server.py          # FastMCP server + tool definitions
-└── connection.py      # CiscoConnectionManager (netmiko transport)
+├── connection.py      # DeviceConnectionManager (netmiko transport)
+└── bdcom.py           # Custom BDCOM netmiko driver (config-mode overrides)
 ```
 
 ### Adding New Features
 
-1. **New Tools**: Add new `@mcp.tool` functions in `cisco_mcp/server.py`
-2. **Connection Logic**: Extend `CiscoConnectionManager` in `cisco_mcp/connection.py`
+1. **New Tools**: Add new `@mcp.tool` functions in `device_mcp/server.py`
+2. **Connection Logic**: Extend `DeviceConnectionManager` in `device_mcp/connection.py`
+3. **New Platforms**: For a vendor netmiko doesn't support, add a driver like
+   `device_mcp/bdcom.py` and register it in `_CUSTOM_DRIVERS` in `connection.py`
 
 ## 🧪 Testing
 
 ### Manual Testing
 1. Run the offline smoke test: `python smoke_test.py`
-2. Test with a real Cisco device or simulator
+2. Test with a real device (Cisco IOS, BDCOM, etc.) or simulator
 3. Verify all connection types (SSH/Telnet)
 4. Test different command modes (user/enable/config)
 
@@ -87,7 +90,7 @@ cisco_mcp/
 2. Test with the latest version
 3. Gather relevant information:
    - Python version
-   - Cisco device type and IOS version
+   - Device type (e.g. cisco_ios, bdcom) and OS version
    - Connection method (SSH/Telnet)
    - Error messages and logs
 
@@ -107,7 +110,7 @@ What you expected to happen.
 
 **Environment**
 - Python version:
-- Cisco device model:
+- Device model:
 - IOS version:
 - Connection method:
 
@@ -197,4 +200,4 @@ Contributors will be recognized in:
 - Release notes for significant contributions
 - GitHub contributors page
 
-Thank you for contributing to Cisco MCP Server!
+Thank you for contributing to Device MCP Server!

@@ -97,3 +97,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Large vendor documentation (kept locally for reference, not committed)
+BDCOM Switch L3 Doc/
