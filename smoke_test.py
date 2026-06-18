@@ -7,11 +7,16 @@ host:port resolution and error paths.
 
 import asyncio
 
+from netmiko.exceptions import ConfigInvalidException
+
 from device_mcp.bdcom import BdcomSSH, BdcomTelnet
 from device_mcp.connection import (
     DeviceConnection,
     DeviceConnectionManager,
     _ConsoleRingLog,
+    _classify_prompt,
+    _detect_device_error,
+    _parse_help_tokens,
     _target,
     resolve_platform,
 )
@@ -20,6 +25,7 @@ from device_mcp.server import mcp
 EXPECTED_TOOLS = {
     "connect_device",
     "execute_command",
+    "configure_device",
     "disconnect_device",
     "list_connections",
     "get_console_history",
@@ -142,6 +148,156 @@ class _FakeCli:
         data, self._out = self._out, ""
         return data
 
+    def find_prompt(self) -> str:
+        return "Switch#"
+
+
+class _FakeNet:
+    """A netmiko-channel stand-in for testing execute_command / configure offline."""
+
+    def __init__(self, *, output: str = "", prompt: str = "Switch#",
+                 enable: bool = True, config: bool = False,
+                 send_raise: Exception | None = None,
+                 config_raise: Exception | None = None) -> None:
+        self._output = output
+        self._prompt = prompt
+        self._enable = enable
+        self._config = config
+        self._send_raise = send_raise
+        self._config_raise = config_raise
+        self.sent: list[str] = []
+        self.config_calls: list[tuple] = []
+
+    # mode introspection / transitions used by _switch_mode("auto")
+    def check_enable_mode(self) -> bool:
+        return self._enable
+
+    def check_config_mode(self) -> bool:
+        return self._config
+
+    def exit_config_mode(self) -> str:
+        self._config = False
+        return ""
+
+    def enable(self) -> str:
+        self._enable = True
+        return ""
+
+    def find_prompt(self) -> str:
+        return self._prompt
+
+    def send_command(self, command: str, **kw) -> str:
+        self.sent.append(command)
+        if self._send_raise:
+            raise self._send_raise
+        return self._output
+
+    def send_command_timing(self, command: str, **kw) -> str:
+        self.sent.append(command)
+        return self._output
+
+    def send_config_set(self, config_commands, **kw) -> str:
+        self.config_calls.append((list(config_commands), kw))
+        if self._config_raise:
+            raise self._config_raise
+        return self._output
+
+
+def _attach(mgr: DeviceConnectionManager, key: str, net) -> None:
+    host, port = key.rsplit(":", 1)
+    mgr._connections[key] = DeviceConnection(
+        config={"host": host, "port": int(port), "device_type": "bdcom",
+                "protocol": "telnet", "enable_password": None},
+        connection=net,
+    )
+
+
+def check_diagnostics() -> None:
+    """Pure error/prompt/help parsers."""
+    caret = " " * 15 + "^"
+    out = f"show interface status\n{caret}\nUnknown command"
+    de = _detect_device_error(out)
+    assert de and de["message"].startswith("Unknown command"), de
+    assert de["near"] == "status", de
+    de2 = _detect_device_error("% Invalid input detected at '^' marker.")
+    assert de2 and "Invalid input" in de2["message"], de2
+    assert _detect_device_error("BDCOM S3954 Software, Version 2.2.0F") is None
+
+    assert _classify_prompt("Switch>") == "user"
+    assert _classify_prompt("Switch#") == "enable"
+    assert _classify_prompt("Switch_config#") == "config"
+    assert _classify_prompt("Switch_config_vlan30#") == "config"
+    assert _classify_prompt("R1(config)#") == "config"
+    assert _classify_prompt("R1#") == "enable"
+
+    tokens = _parse_help_tokens(
+        "  interface                  -- Interface status\n"
+        "  ip                         -- IP config\n"
+        "Switch_config#"
+    )
+    assert tokens == ["interface", "ip"], tokens
+    print("diagnostics helpers: OK")
+
+
+def check_execute_footer() -> None:
+    mgr = DeviceConnectionManager()
+
+    caret = " " * 15 + "^"
+    err = f"show interface status\n{caret}\nUnknown command"
+    _attach(mgr, "h:23", _FakeNet(output=err, prompt="Switch#"))
+    res = mgr.execute_command("h", "show interface status", port=23)
+    assert "Unknown command" in res                      # raw output preserved
+    assert "[device-mcp] device error: Unknown command near 'status'" in res, res
+    assert "now: Switch# (enable)" in res, res
+
+    _attach(mgr, "h:24", _FakeNet(output="...Version 2.2.0F", prompt="Switch#"))
+    ok = mgr.execute_command("h", "show version", port=24)
+    assert ok.rstrip().endswith("[device-mcp] ok | now: Switch# (enable)"), ok
+
+    _attach(mgr, "h:25", _FakeNet(send_raise=RuntimeError("Pattern not detected"),
+                                  prompt="Switch#"))
+    fail = mgr.execute_command("h", "show running-config", port=25)
+    assert "[device-mcp] FAILED:" in fail and "Pattern not detected" in fail, fail
+    print("execute_command footer: OK")
+
+
+def check_configure() -> None:
+    mgr = DeviceConnectionManager()
+
+    net = _FakeNet(output="", prompt="Switch#")
+    _attach(mgr, "h:23", net)
+    cmds = ["vlan 30", "exit", "interface GigaEthernet0/1", "exit"]
+    res = mgr.configure("h", cmds, port=23)
+    assert net.config_calls, "send_config_set was not called"
+    sent, kw = net.config_calls[0]
+    assert sent == cmds, sent
+    assert kw.get("error_pattern"), "error_pattern not forwarded"
+    assert "applied 4 command(s)" in res, res
+
+    net2 = _FakeNet(prompt="Switch_config_vlan30#", config=True,
+                    config_raise=ConfigInvalidException(
+                        "Invalid input detected at command: switchport access vlan 30"))
+    _attach(mgr, "h:24", net2)
+    res2 = mgr.configure("h", ["switchport access vlan 30"], port=24)
+    assert "[device-mcp] FAILED:" in res2, res2
+    assert "switchport access vlan 30" in res2, res2
+    assert "(config)" in res2, res2   # reports it ended in a config submode
+    print("configure: OK")
+
+
+def check_get_help_normalize() -> None:
+    """A manual trailing '?' and multiple trailing spaces are normalized."""
+    mgr = DeviceConnectionManager()
+    cli = _FakeCli()
+    mgr._connections["h:23"] = DeviceConnection(
+        config={"host": "h", "port": 23, "device_type": "bdcom", "protocol": "telnet"},
+        connection=cli,
+    )
+    mgr.get_help("h", "show int?", port=23)     # stray trailing '?' stripped
+    mgr.get_help("h", "show int   ", port=23)   # multiple trailing spaces -> one
+    assert cli.help_requests == ["show int", "show int "], cli.help_requests
+    print("get_help normalize: OK")
+
 
 def check_get_help_clears_line() -> None:
     """Regression: consecutive get_help calls must not leak the prior prefix.
@@ -186,18 +342,29 @@ async def main() -> None:
     assert "host" in required
     assert "username" not in required and "password" not in required, required
 
-    # execute_command: interactive + port params surfaced.
+    # execute_command: interactive + port params surfaced; default mode is auto.
     execute = tools["execute_command"]
     eschema = getattr(execute, "parameters", None) or execute.inputSchema
     eparams = eschema["properties"]
     print("execute_command params:", sorted(eparams))
     assert {"expect_string", "answer", "port"} <= set(eparams)
+    assert eparams["mode"].get("default") == "auto", eparams["mode"]
+
+    # configure_device: batch config tool with a commands list.
+    configure = tools["configure_device"]
+    fschema = getattr(configure, "parameters", None) or configure.inputSchema
+    print("configure_device params:", sorted(fschema["properties"]))
+    assert "commands" in fschema["properties"]
 
     check_resolve_platform()
     check_target()
     check_console_ring()
     check_target_resolution()
+    check_diagnostics()
+    check_execute_footer()
+    check_configure()
     check_get_help_clears_line()
+    check_get_help_normalize()
 
     # Manager error paths (no real device involved).
     mgr = DeviceConnectionManager()

@@ -71,32 +71,59 @@ each is a distinct `host:port` connection:
 }
 ```
 
-### 3. Configuration Commands
+### 3. Configuration — prefer `configure_device` for multi-step
+
+Send an ordered command list as one block; config mode is entered/exited
+automatically and sub-mode prompt changes are handled. Put an `exit` as its own
+list item when moving between contexts:
 
 ```json
 {
-  "tool": "execute_command",
+  "tool": "configure_device",
   "arguments": {
     "host": "192.168.1.1",
-    "command": "interface GigabitEthernet0/1",
-    "mode": "config"
+    "commands": [
+      "interface GigabitEthernet0/1",
+      "ip address 10.1.1.1 255.255.255.0",
+      "no shutdown",
+      "exit"
+    ]
   }
 }
 ```
 
+A single config line can still go through `execute_command` with `mode: "config"`,
+but for sequences `configure_device` reports exactly which line failed:
+
+```json
+{ "tool": "configure_device",
+  "arguments": { "host": "192.168.1.1",
+                 "commands": ["interface GigabitEthernet0/1", "no shutdown", "exit"] } }
+```
+
+#### BDCOM VLAN + SVI + VRF (ordering matters)
+
+`switchport pvid` (not `switchport access vlan`); set the VRF `rd` before using the
+VRF; set `vrf forwarding` **before** the interface addresses (it clears them):
+
 ```json
 {
-  "tool": "execute_command",
+  "tool": "configure_device",
   "arguments": {
-    "host": "192.168.1.1",
-    "command": "ip address 10.1.1.1 255.255.255.0",
-    "mode": "config"
+    "host": "192.168.100.34",
+    "port": 10003,
+    "commands": [
+      "vlan 30", "exit",
+      "ipv6 vrf VRF30", "rd 30:30", "exit",
+      "interface GigaEthernet0/1", "switchport mode access", "switchport pvid 30", "exit",
+      "interface VLAN30",
+      "ipv6 vrf forwarding VRF30",
+      "ipv6 address 30::1/64",
+      "exit"
+    ]
   }
 }
 ```
-
-> The server enters the right mode automatically (e.g. `config` runs
-> `configure terminal` on Cisco IOS and `config` on BDCOM).
 
 ### 4. Interactive Commands (confirmations)
 

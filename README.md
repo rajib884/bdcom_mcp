@@ -18,11 +18,13 @@ platform.
 - **🧩 Multi-Vendor**: Cisco IOS (default), BDCOM, and 400+ netmiko platforms via a `device_type` selector
 - **🔄 Persistent Connections**: Maintain long-lived connections for efficient command execution
 - **🎯 Universal Command Execution**: Execute any device command through a single interface
-- **🔐 Mode Management**: Automatic switching between user, enable, and configuration modes
+- **🔐 Mode Management**: `auto` default runs at the current privilege level without downgrading; `user`/`enable`/`config` force a level
+- **🧾 Self-describing results**: every command returns its raw output plus a `[device-mcp]` footer reporting device errors (vs transport failures) and where the CLI ended up — see [Result footer](#-result-footer)
+- **🧱 Batch Config**: `configure_device` applies an ordered command list atomically, handles sub-mode nesting, and reports the exact line that failed
 - **🌐 Multi-Device Support**: Manage many devices at once — including several behind **one IP on different ports** (console/terminal servers), addressed as `host:port`
 - **✅ Interactive Confirmations**: Answer `(y/n)` / `[confirm]` prompts (e.g. `reboot`, `delete startup-config`) via `expect_string` + `answer`
 - **📜 Console Diagnostics**: Per-connection raw I/O history (`get_console_history`) and live stream reads (`read_console_stream`) for auditing logins, desyncs, and reboots
-- **❓ Inline Help**: Query CLI `?` help with `get_help`
+- **❓ Inline Help**: Query CLI `?` help with `get_help` (parsed `options:` footer)
 - **🤖 AI-Friendly**: Natural language command translation through AI assistants
 - **📊 Connection Monitoring**: Track active connections and their status
 
@@ -108,12 +110,17 @@ Establish a connection to a network device.
 ```
 
 #### `execute_command`
-Execute a command on a connected device.
+Execute a command on a connected device. Returns the **raw command output** plus a
+one-line `[device-mcp]` footer reporting any device error and where the CLI ended
+up (see [Result footer](#-result-footer)).
 
 **Parameters:**
 - `host` (required): Target device IP/hostname
 - `command` (required): Command to execute
-- `mode` (optional): `user`, `enable`, or `config` (default: `user`)
+- `mode` (optional): `auto` (default), `user`, `enable`, or `config`. `auto` runs
+  at the current privilege level **without downgrading** (so `show` works on BDCOM,
+  which connects in enable); `user`/`enable`/`config` force that exact level. For
+  multi-step config prefer `configure_device`.
 - `expect_string` (optional): Regex for an interactive confirmation prompt
 - `answer` (optional): Reply to send when `expect_string` matches
 - `port` (optional): Required only when several devices share an IP
@@ -122,8 +129,7 @@ Execute a command on a connected device.
 ```json
 {
   "host": "192.168.1.1",
-  "command": "show version",
-  "mode": "user"
+  "command": "show version"
 }
 ```
 
@@ -136,6 +142,33 @@ Execute a command on a connected device.
   "mode": "enable",
   "expect_string": "\\(y/n\\)",
   "answer": "y"
+}
+```
+
+#### `configure_device`
+Apply a sequence of configuration commands as one block. Enters config mode, sends
+each command in order (handling sub-mode prompt changes like
+`Switch_config_vlan30#`), then exits config mode. If a command is rejected, the
+footer reports **which one** failed and where the session was left — no partial
+config applied silently.
+
+**Parameters:**
+- `host` (required): Target device IP/hostname
+- `commands` (required): Ordered list of config commands. Send a sub-mode `exit` as
+  its own list item when moving between contexts. A trailing `;` is **not** a
+  separator.
+- `port` (optional): Required only when several devices share an IP
+
+**Example (BDCOM VLAN + access port):**
+```json
+{
+  "host": "192.168.100.34",
+  "port": 10003,
+  "commands": [
+    "vlan 30", "exit",
+    "interface GigaEthernet0/1",
+    "switchport mode access", "switchport pvid 30", "exit"
+  ]
 }
 ```
 
@@ -169,10 +202,33 @@ device reboot back to its login prompt.
 
 #### `get_help`
 Send `command_prefix + '?'` and return the device's inline CLI help, then clear the
-input line so the next command runs cleanly.
+input line so the next command runs cleanly. The footer lists the parsed next-token
+`options:` (or flags an invalid prefix). The prefix is normalized (a stray trailing
+`?` is dropped, multiple trailing spaces collapse to one), and long lists like
+`ip ?` are no longer truncated.
 
 **Parameters:** `host` (required), `command_prefix` (optional, e.g. `"show "`),
 `port` (optional).
+
+### 🧾 Result footer
+
+`execute_command`, `configure_device`, and `get_help` append one compact status
+line so the model never has to guess session state:
+
+```
+<raw command output>
+
+[device-mcp] ok | now: Switch# (enable)
+[device-mcp] device error: Unknown command near 'status' | now: Switch# (enable)
+[device-mcp] FAILED: <transport exception> | now: <prompt|unknown>
+[device-mcp] options: interface, ip, ipv6 | now: Switch_config# (config)
+```
+
+- **device error** — the device *rejected* the command (with the offending token
+  when it prints a `^` caret); distinct from a **FAILED** transport error (e.g. a
+  prompt-detection desync — reconnect).
+- **now** — the current prompt and derived mode (`user`/`enable`/`config`), so the
+  model knows where a sub-mode (e.g. `Switch_config_vlan30#`) left it.
 
 ### 💡 Usage Examples
 
@@ -258,6 +314,25 @@ driver instead enters enable mode and disables paging there.
   (and `get_console_history`) as sensitive.
 - If a session ever desyncs, `disconnect_device` then `connect_device` for a clean
   one rather than retrying the failing command.
+
+#### BDCOM CLI cheat-sheet (commands the server can't enforce)
+
+The server is a generic executor, so these BDCOM-specific rules are on the caller
+(the footer's `device error` will tell you when one is violated):
+
+- **Access-port VLAN:** there is no Cisco `switchport access vlan <id>`. Use
+  `switchport mode access` then `switchport pvid <id>`.
+- **VRF needs an RD first:** after `ip vrf <name>` / `ipv6 vrf <name>`, set
+  `rd <a>:<b>` **before** referencing the VRF anywhere (`vrf forwarding`, routes) —
+  otherwise: `%Err, VRF '<n>' does not exist or does not have a RD.`
+- **Order around VRF on an SVI:** setting `vrf forwarding` / `ipv6 vrf forwarding`
+  on an interface **clears its existing IP/IPv6 addresses**. Set the VRF first, then
+  (re-)apply the addresses.
+- **Sub-modes don't auto-exit:** `vlan X`, `interface X`, `ip vrf X` each open a
+  sub-mode; send an explicit `exit` between contexts — or just use
+  `configure_device` with the `exit` lines in the list.
+- **Privileged for `show`:** BDCOM `show` needs enable mode; the default `auto`
+  mode keeps you there after connect, so no `mode` is needed.
 
 ### 🔒 Security Notes
 
@@ -349,8 +424,14 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 `username` / `password` 可选（用于无认证的控制台）；默认 BDCOM 进入 `enable` 无需密码。
 
 #### `execute_command`
-在已连接的设备上执行命令。支持 `expect_string` + `answer` 应答交互式 `(y/n)` 确认；
-`port` 仅在同一 IP 有多台设备时需要。
+在已连接的设备上执行命令。`mode` 默认 `auto`（在当前权限级别执行、不降级；BDCOM 连接后处于
+enable，因此 `show` 可直接工作），也可强制 `user`/`enable`/`config`。返回原始输出加一行
+`[device-mcp]` footer（报告设备错误与当前提示符/模式）。支持 `expect_string` + `answer`
+应答交互式 `(y/n)` 确认；`port` 仅在同一 IP 有多台设备时需要。
+
+#### `configure_device`
+按顺序批量下发配置命令（自动进出配置模式，处理子模式提示符变化）。在上下文之间用单独的
+`exit` 列表项切换；若某条命令被拒绝，footer 会指出是哪一条以及会话停在何处。
 
 #### `disconnect_device`
 断开与设备的连接（同一 IP 多设备时需指定 `port`）。
@@ -365,7 +446,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 不发送命令，直接读取实时控制台输出，直到匹配正则或超时（适合观察设备重启回到登录提示符）。
 
 #### `get_help`
-发送 `command_prefix + '?'` 返回设备的内联 CLI 帮助，并清理输入行。
+发送 `command_prefix + '?'` 返回设备的内联 CLI 帮助，并清理输入行；footer 列出解析出的
+下一级 `options:`。会归一化前缀（去掉手动多写的 `?`、合并多余尾随空格），长列表（如 `ip ?`）
+不再被截断。
 
 ### 📟 BDCOM 说明
 
@@ -376,6 +459,12 @@ Ctrl-Z 退出配置模式，特权模式用 `exit` 退出。BDCOM 不支持 `ter
 `terminal length 0`（关闭分页）仅在特权模式可用——因此驱动会先进入 enable 模式再关闭分页，
 避免大输出在 `--More--` 处卡住导致会话错乱。默认 BDCOM `enable` 无需密码。连接时设置
 `"device_type": "bdcom"` 即可。
+
+**BDCOM CLI 速查（服务器无法强制，需调用方遵循）：**
+- 接入口 VLAN 用 `switchport mode access` + `switchport pvid <id>`（没有 `switchport access vlan`）。
+- VRF 必须先在 `ip vrf`/`ipv6 vrf` 内设置 `rd a:b` 再被引用，否则报 `does not have a RD`。
+- 在接口上设置 `vrf forwarding` 会清除其已配置的 IP/IPv6 地址——先设 VRF，再配地址。
+- 子模式（`vlan`/`interface`/`ip vrf`）不会自动退出，上下文之间需 `exit`，或用 `configure_device`。
 
 ### 📝 许可证
 

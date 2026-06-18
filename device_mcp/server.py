@@ -102,12 +102,14 @@ def execute_command(
         ),
     ],
     mode: Annotated[
-        Literal["user", "enable", "config"],
+        Literal["auto", "user", "enable", "config"],
         Field(
-            description="Execution mode: user (default), enable (privileged), "
-            "or config (configuration)"
+            description="Execution mode: auto (default) runs at the current "
+            "privilege level without downgrading; user/enable/config force that "
+            "exact level. Use config for a single config command (prefer "
+            "configure_device for multi-step config)."
         ),
-    ] = "user",
+    ] = "auto",
     expect_string: Annotated[
         Optional[str],
         Field(description="Regex pattern to expect for an interactive command "
@@ -122,12 +124,44 @@ def execute_command(
 ) -> str:
     """Execute a command on a connected network device.
 
-    The device must be connected first using ``connect_device``.
+    The device must be connected first using ``connect_device``. Returns the raw
+    command output followed by a ``[device-mcp]`` footer line reporting any device
+    error and where the CLI ended up (prompt + mode).
     """
     try:
         return _manager.execute_command(
             host, command, mode, expect_string, answer, port
         )
+    except Exception as exc:  # noqa: BLE001 - return AI-friendly error text
+        return f"Error: {exc}"
+
+
+@mcp.tool
+def configure_device(
+    host: Annotated[
+        str, Field(description="IP address or hostname of the connected device")
+    ],
+    commands: Annotated[
+        list[str],
+        Field(
+            description="Ordered configuration commands. They are sent as one block "
+            "(config mode is entered/exited automatically). Send a sub-mode 'exit' "
+            "as its own list item when moving between contexts, e.g. "
+            '["vlan 30", "exit", "interface GigaEthernet0/1", "switchport mode '
+            'access", "exit"]. A trailing ";" is not a command separator.'
+        ),
+    ],
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+) -> str:
+    """Apply a sequence of configuration commands to a connected device.
+
+    Enters config mode, sends each command in order (handling sub-mode prompt
+    changes), then exits config mode. Returns the combined output plus a
+    ``[device-mcp]`` footer; if a command is rejected the footer reports which one
+    failed and where the session was left, instead of applying a partial config.
+    """
+    try:
+        return _manager.configure(host, commands, port)
     except Exception as exc:  # noqa: BLE001 - return AI-friendly error text
         return f"Error: {exc}"
 

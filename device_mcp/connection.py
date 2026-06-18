@@ -25,6 +25,7 @@ from typing import Any, Literal, Optional
 import netmiko
 from netmiko import ConnectHandler
 from netmiko.exceptions import (
+    ConfigInvalidException,
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
 )
@@ -32,7 +33,9 @@ from netmiko.exceptions import (
 from .bdcom import BdcomSSH, BdcomTelnet
 
 Protocol = Literal["ssh", "telnet"]
-Mode = Literal["user", "enable", "config"]
+# "auto" (the default) runs at the current privilege level without downgrading;
+# user/enable/config force that exact level.
+Mode = Literal["auto", "user", "enable", "config"]
 
 # Read timeouts (seconds) for command execution. Generous defaults so large
 # outputs such as ``show running-config`` / ``show tech-support`` complete.
@@ -56,9 +59,117 @@ _WIZARD_RE = re.compile(
     r"initial (?:configuration|config) dialog|\[yes/no\]|\[yes\]:", re.IGNORECASE
 )
 
+# Markers that mean the device *rejected* a command (vs a transport failure).
+# Matched per line so a description containing one of these words is less likely
+# to false-positive. Covers BDCOM and Cisco IOS phrasing.
+_DEVICE_ERROR_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"%?\s*Unknown command"
+    r"|%?\s*Incomplete command"
+    r"|%?\s*Ambiguous command"
+    r"|%?\s*Too many parameters"
+    r"|%?\s*Parameter out of range"
+    r"|%\s*Invalid input"
+    r"|%\s*Bad "
+    r"|%Err"
+    r"|.*does not exist or does not have"
+    r")"
+)
+# error_pattern handed to netmiko send_config_set so a bad config line raises.
+_CONFIG_ERROR_RE = (
+    r"(?i)(?:Unknown command|Incomplete command|Ambiguous command"
+    r"|Too many parameters|Parameter out of range|Invalid input|%Err"
+    r"|does not exist or does not have)"
+)
+_CARET_LINE_RE = re.compile(r"^(\s*)\^\s*$")
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _detect_device_error(output: str) -> Optional[dict[str, Any]]:
+    """Find a device command-rejection in ``output``.
+
+    Returns ``{"message": <error line>, "near": <token>|None}`` or ``None``. When
+    the device prints a caret (``^``) line marking the bad token, the word above
+    the caret column is reported as ``near``. Pure / offline-testable.
+    """
+    match = _DEVICE_ERROR_RE.search(output)
+    if not match:
+        return None
+    message = match.group(0).strip()
+    near = None
+    lines = output.splitlines()
+    for i, line in enumerate(lines):
+        caret = _CARET_LINE_RE.match(line)
+        if caret and i > 0:
+            col = len(caret.group(1))
+            prev = lines[i - 1]
+            # Take the whitespace-delimited token spanning the caret column.
+            start = prev.rfind(" ", 0, col + 1) + 1
+            end = prev.find(" ", col)
+            near = prev[start : end if end != -1 else len(prev)].strip() or None
+            break
+    return {"message": message, "near": near}
+
+
+def _classify_prompt(prompt: str) -> str:
+    """Classify a device prompt into user / enable / config. Pure."""
+    p = prompt.strip()
+    if p.endswith(">"):
+        return "user"
+    if "_config" in p or "(config" in p:
+        return "config"
+    if p.endswith("#"):
+        return "enable"
+    return "unknown"
+
+
+def _describe_prompt(net: Any) -> tuple[Optional[str], str]:
+    """Read the current prompt and classify it; best effort (does channel I/O)."""
+    try:
+        prompt = net.find_prompt()
+    except Exception:  # noqa: BLE001
+        return None, "unknown"
+    return prompt, _classify_prompt(prompt)
+
+
+def _parse_help_tokens(output: str) -> list[str]:
+    """Parse next-token names from CLI '?' help lines (``token  -- description``)."""
+    tokens = []
+    for line in output.splitlines():
+        m = re.match(r"\s*(\S+)\s+--\s+", line)
+        if m:
+            tokens.append(m.group(1))
+    return tokens
+
+
+def _footer(
+    *,
+    device_error: Optional[dict[str, Any]] = None,
+    failure: Optional[str] = None,
+    prompt: Optional[str] = None,
+    mode: str = "unknown",
+    options: Optional[list[str]] = None,
+    note: Optional[str] = None,
+) -> str:
+    """Build the single-line ``[device-mcp]`` status footer appended to output."""
+    where = f"now: {prompt} ({mode})" if prompt else f"now: unknown ({mode})"
+    if failure:
+        head = f"FAILED: {failure}"
+    elif device_error:
+        near = device_error.get("near")
+        head = "device error: " + device_error["message"]
+        if near:
+            head += f" near '{near}'"
+    elif note:
+        head = note
+    elif options is not None:
+        head = "options: " + (", ".join(options) if options else "(none)")
+    else:
+        head = "ok"
+    return f"[device-mcp] {head} | {where}"
 
 
 def _target(host: str, port: int | None, protocol: Protocol = "ssh") -> str:
@@ -255,11 +366,17 @@ class DeviceConnectionManager:
         self,
         host: str,
         command: str,
-        mode: Mode = "user",
+        mode: Mode = "auto",
         expect_string: str | None = None,
         answer: str | None = None,
         port: int | None = None,
     ) -> str:
+        """Run a command and return its raw output plus a ``[device-mcp]`` footer.
+
+        The footer reports whether the device rejected the command (a *device
+        error*, distinct from a transport failure) and where the CLI ended up
+        (prompt + mode), so the caller can react without re-deriving session state.
+        """
         with self._lock:
             conn = self._connections[self._resolve(host, port)]
             if not conn.connected:
@@ -267,10 +384,10 @@ class DeviceConnectionManager:
                     f"No active connection to {host}. Please connect first."
                 )
 
+            net = conn.connection
             conn.last_activity = _now()
             try:
                 self._switch_mode(conn, mode)
-                net = conn.connection
                 if mode == "config":
                     # Prompt changes in config mode, so use timing-based reads.
                     output = net.send_command_timing(
@@ -296,9 +413,63 @@ class DeviceConnectionManager:
                             raise
                 else:
                     output = net.send_command(command, read_timeout=_EXEC_READ_TIMEOUT)
+            except Exception as exc:  # noqa: BLE001 - report what broke + where we are
+                prompt, where = _describe_prompt(net)
+                return _footer(failure=f"{type(exc).__name__}: {exc}",
+                               prompt=prompt, mode=where)
+
+            prompt, where = _describe_prompt(net)
+            conn.current_mode = where if where in ("user", "enable", "config") else conn.current_mode
+            device_error = _detect_device_error(output)
+            return output.rstrip("\n") + "\n\n" + _footer(
+                device_error=device_error, prompt=prompt, mode=where
+            )
+
+    # ------------------------------------------------------------------ configure
+    def configure(
+        self, host: str, commands: list[str], port: int | None = None
+    ) -> str:
+        """Apply a sequence of config commands as one block; return output+footer.
+
+        Uses netmiko ``send_config_set``: enters config mode, sends each command in
+        order (tolerating submode prompt changes), then exits config mode. If a
+        command is rejected the footer reports which one and where the session was
+        left, instead of silently applying a partial/wrong config.
+        """
+        with self._lock:
+            conn = self._connections[self._resolve(host, port)]
+            if not conn.connected:
+                raise RuntimeError(
+                    f"No active connection to {host}. Please connect first."
+                )
+            net = conn.connection
+            conn.last_activity = _now()
+            try:
+                # BDCOM (and Cisco) only accept config from privileged mode;
+                # send_config_set enters config but assumes enable first.
+                if not net.check_enable_mode():
+                    self._enter_enable(net)
+                output = net.send_config_set(
+                    commands,
+                    error_pattern=_CONFIG_ERROR_RE,
+                    read_timeout=_CONFIG_READ_TIMEOUT,
+                )
+            except ConfigInvalidException as exc:
+                # send_config_set may strand the session in a submode on error.
+                prompt, where = _describe_prompt(net)
+                conn.current_mode = where if where in ("user", "enable", "config") else conn.current_mode
+                return _footer(failure=str(exc), prompt=prompt, mode=where)
             except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"Command execution failed: {exc}") from exc
-            return output
+                prompt, where = _describe_prompt(net)
+                return _footer(failure=f"{type(exc).__name__}: {exc}",
+                               prompt=prompt, mode=where)
+
+            conn.current_mode = "enable"  # send_config_set exits config mode
+            prompt, where = _describe_prompt(net)
+            conn.current_mode = where if where in ("user", "enable", "config") else conn.current_mode
+            return output.rstrip("\n") + "\n\n" + _footer(
+                note=f"applied {len(commands)} command(s)", prompt=prompt, mode=where
+            )
 
     # ------------------------------------------------------------- diagnostics
     def get_console_history(
@@ -353,15 +524,31 @@ class DeviceConnectionManager:
         So after reading the help we backspace the prefix off the line. Ctrl-C /
         Ctrl-U are not reliable on BDCOM, so we use backspaces and stop at the bell
         (``\\x07``) the CLI emits once the line is empty.
+
+        Returns the raw help text plus a ``[device-mcp]`` footer listing the parsed
+        next-token options (or flagging an invalid prefix).
         """
+        # Normalize: a manually appended "?" would double up, and multiple trailing
+        # spaces return an empty result on BDCOM. Strip one trailing "?" and
+        # collapse a trailing whitespace run to a single space (which preserves the
+        # "list the next token" intent).
+        prefix = command_prefix
+        if prefix.endswith("?"):
+            prefix = prefix[:-1]
+        stripped = prefix.rstrip()
+        if stripped != prefix:
+            prefix = stripped + " "
+
         with self._lock:
             conn = self._connections[self._resolve(host, port)]
             net = conn.connection
             conn.last_activity = _now()
 
-            net.write_channel(command_prefix + "?")
+            net.write_channel(prefix + "?")
             out = ""
-            deadline = time.time() + 3.0
+            # Long help lists (e.g. "ip ?") can take a while; cap generously and
+            # rely on a quiet period to detect the end.
+            deadline = time.time() + 8.0
             empties = 0
             while time.time() < deadline and empties < 3:
                 time.sleep(0.3)
@@ -375,8 +562,15 @@ class DeviceConnectionManager:
             # Erase the prefix the device redrew on the line so it is not prepended
             # to whatever command runs next. Bound the loop to the prefix length
             # (plus margin) so a device that never bells can't spin.
-            self._clear_input_line(net, len(command_prefix) + 8)
-            return out
+            self._clear_input_line(net, len(prefix) + 8)
+            prompt, where = _describe_prompt(net)
+
+        device_error = _detect_device_error(out)
+        if device_error:
+            footer = _footer(device_error=device_error, prompt=prompt, mode=where)
+        else:
+            footer = _footer(options=_parse_help_tokens(out), prompt=prompt, mode=where)
+        return out.rstrip("\n") + "\n\n" + footer
 
     @staticmethod
     def _clear_input_line(net: Any, max_chars: int) -> None:
@@ -402,7 +596,15 @@ class DeviceConnectionManager:
     def _switch_mode(self, conn: DeviceConnection, target: Mode) -> None:
         net = conn.connection
 
-        if target == "enable":
+        if target == "auto":
+            # Run at the current privilege level: de-nest config submodes but do
+            # not downgrade. BDCOM lands in enable at connect (our driver), so
+            # 'show' works here; a Cisco user-exec session stays user-exec.
+            if net.check_config_mode():
+                net.exit_config_mode()
+            conn.current_mode = "enable" if net.check_enable_mode() else "user"
+
+        elif target == "enable":
             if net.check_config_mode():
                 net.exit_config_mode()
             if not net.check_enable_mode():
