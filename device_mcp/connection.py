@@ -347,14 +347,18 @@ class DeviceConnectionManager:
     ) -> str:
         """Send ``command_prefix + '?'`` and return the device's inline help.
 
-        ``?`` triggers help without a newline, so we write it raw, drain the
-        redrawn output, then send Ctrl-C to clear the buffered input line so the
-        next command runs cleanly. Best effort - may need per-vendor tuning.
+        ``?`` triggers help without a newline and leaves the typed prefix sitting on
+        the input line. If it is not removed it gets prepended to the next command
+        (e.g. ``show int`` + ``show interface ?`` -> ``show intshow interface ?``).
+        So after reading the help we backspace the prefix off the line. Ctrl-C /
+        Ctrl-U are not reliable on BDCOM, so we use backspaces and stop at the bell
+        (``\\x07``) the CLI emits once the line is empty.
         """
         with self._lock:
             conn = self._connections[self._resolve(host, port)]
             net = conn.connection
             conn.last_activity = _now()
+
             net.write_channel(command_prefix + "?")
             out = ""
             deadline = time.time() + 3.0
@@ -367,14 +371,32 @@ class DeviceConnectionManager:
                     empties = 0
                 else:
                     empties += 1
-            # Abort the still-buffered input line (Ctrl-C) and discard the redraw.
-            try:
-                net.write_channel("\x03")
-                time.sleep(0.3)
-                net.read_channel()
-            except Exception:  # noqa: BLE001 - cleanup is best effort
-                pass
+
+            # Erase the prefix the device redrew on the line so it is not prepended
+            # to whatever command runs next. Bound the loop to the prefix length
+            # (plus margin) so a device that never bells can't spin.
+            self._clear_input_line(net, len(command_prefix) + 8)
             return out
+
+    @staticmethod
+    def _clear_input_line(net: Any, max_chars: int) -> None:
+        """Backspace the device's input line until it is empty.
+
+        A Cisco-style CLI (including BDCOM) echoes a bell (``\\x07``) when backspace
+        is pressed on an already-empty line. Starting from a line that holds the
+        typed prefix, sending one backspace at a time erases exactly that text and
+        stops at the single terminating bell - so there is no storm of bells on an
+        empty line, and nothing is left to leak into the next command. ``max_chars``
+        bounds the loop for a device that never bells.
+        """
+        try:
+            for _ in range(max(0, max_chars)):
+                net.write_channel("\x08")
+                time.sleep(0.08)
+                if "\x07" in net.read_channel():  # BEL: line is now empty
+                    break
+        except Exception:  # noqa: BLE001 - cleanup is best effort
+            pass
 
     # ------------------------------------------------------------- mode switching
     def _switch_mode(self, conn: DeviceConnection, target: Mode) -> None:

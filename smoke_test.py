@@ -107,6 +107,65 @@ def check_target_resolution() -> None:
     print("host:port resolution: OK")
 
 
+class _FakeCli:
+    """A tiny Cisco/BDCOM-like CLI line editor for testing line clearing.
+
+    Models the input-line buffer: a backspace erases the last char, or echoes a
+    bell (\\x07) if the line is already empty (BDCOM behavior); ``?`` records the
+    current prefix as a help request without consuming the line.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self._out = ""
+        self.help_requests: list[str] = []
+
+    def write_channel(self, data: str) -> None:
+        for ch in data:
+            if ch == "\x08":  # backspace
+                if self.buffer:
+                    self.buffer = self.buffer[:-1]
+                    self._out += "\b \b"
+                else:
+                    self._out += "\x07"  # bell: nothing left to erase
+            elif ch == "?":
+                self.help_requests.append(self.buffer)
+                self._out += f"\n  <help for {self.buffer!r}>\nSwitch#{self.buffer}"
+            elif ch in ("\n", "\r"):
+                self.buffer = ""
+                self._out += "\nSwitch#"
+            else:
+                self.buffer += ch
+                self._out += ch
+
+    def read_channel(self) -> str:
+        data, self._out = self._out, ""
+        return data
+
+
+def check_get_help_clears_line() -> None:
+    """Regression: consecutive get_help calls must not leak the prior prefix.
+
+    The original bug prepended a previous prefix to the next request, e.g.
+    ``show int`` then ``show interface `` produced ``show intshow interface ?``.
+    """
+    mgr = DeviceConnectionManager()
+    cli = _FakeCli()
+    mgr._connections["h:23"] = DeviceConnection(
+        config={"host": "h", "port": 23, "device_type": "bdcom", "protocol": "telnet"},
+        connection=cli,
+    )
+
+    mgr.get_help("h", "show int", port=23)
+    assert cli.buffer == "", f"input line not cleared after get_help: {cli.buffer!r}"
+    mgr.get_help("h", "show interface ", port=23)
+    assert cli.buffer == "", f"input line not cleared after get_help: {cli.buffer!r}"
+
+    # The device saw exactly our two prefixes - no leakage between calls.
+    assert cli.help_requests == ["show int", "show interface "], cli.help_requests
+    print("get_help line-clear: OK")
+
+
 async def main() -> None:
     tool_list = await mcp.list_tools()
     tools = {t.name: t for t in tool_list}
@@ -138,6 +197,7 @@ async def main() -> None:
     check_target()
     check_console_ring()
     check_target_resolution()
+    check_get_help_clears_line()
 
     # Manager error paths (no real device involved).
     mgr = DeviceConnectionManager()
