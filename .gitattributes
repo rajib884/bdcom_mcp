@@ -1,0 +1,9 @@
+# Normalize line endings so editor/formatter churn doesn't pollute diffs.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+
+# Vendor PDFs and other binaries
+*.pdf binary

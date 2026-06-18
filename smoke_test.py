@@ -1,14 +1,31 @@
-"""Offline smoke test: verify the FastMCP server loads and registers tools.
+"""Offline smoke test: verify the FastMCP server loads and behaves correctly.
 
-Does not touch any network device. It inspects the registered tool set, the
-pure platform-resolution helper, and the connection manager's error paths.
+Does not touch any network device. It inspects the registered tool set, the pure
+platform/target helpers, the console ring buffer, and the connection manager's
+host:port resolution and error paths.
 """
 
 import asyncio
 
 from device_mcp.bdcom import BdcomSSH, BdcomTelnet
-from device_mcp.connection import DeviceConnectionManager, resolve_platform
+from device_mcp.connection import (
+    DeviceConnection,
+    DeviceConnectionManager,
+    _ConsoleRingLog,
+    _target,
+    resolve_platform,
+)
 from device_mcp.server import mcp
+
+EXPECTED_TOOLS = {
+    "connect_device",
+    "execute_command",
+    "disconnect_device",
+    "list_connections",
+    "get_console_history",
+    "read_console_stream",
+    "get_help",
+}
 
 
 def check_resolve_platform() -> None:
@@ -30,29 +47,97 @@ def check_resolve_platform() -> None:
     print("resolve_platform: OK")
 
 
+def check_target() -> None:
+    assert _target("10.0.0.1", None, "ssh") == "10.0.0.1:22"
+    assert _target("10.0.0.1", None, "telnet") == "10.0.0.1:23"
+    assert _target("10.0.0.1", 10003, "telnet") == "10.0.0.1:10003"
+    print("_target: OK")
+
+
+def check_console_ring() -> None:
+    ring = _ConsoleRingLog(maxlen=3)
+    ring.write(b"a\nb\nc\nd\n")          # only the last 3 complete lines survive
+    assert ring.text(10) == "b\nc\nd", ring.text(10)
+    ring.write(b"partial")               # a partial (no newline) line is shown too
+    assert ring.text(10).endswith("partial")
+    assert ring.text(1) == "partial"
+    ring.write(" tail\n")                # str input is accepted as well as bytes
+    assert ring.text(1) == "partial tail"
+    print("_ConsoleRingLog: OK")
+
+
+def check_target_resolution() -> None:
+    """Same-IP / different-port connections must stay independent."""
+    mgr = DeviceConnectionManager()
+
+    def fake(host: str, port: int) -> None:
+        mgr._connections[f"{host}:{port}"] = DeviceConnection(
+            config={"host": host, "port": port, "device_type": "bdcom",
+                    "protocol": "telnet", "enable_password": None},
+            connection=None,
+        )
+
+    fake("1.1.1.1", 10003)
+    fake("1.1.1.1", 10004)
+    fake("2.2.2.2", 23)
+
+    # explicit port -> exact key
+    assert mgr._resolve("1.1.1.1", 10004) == "1.1.1.1:10004"
+    # lone connection on a host resolves without a port
+    assert mgr._resolve("2.2.2.2", None) == "2.2.2.2:23"
+    # ambiguous host (two ports) without a port -> error naming the ports
+    try:
+        mgr._resolve("1.1.1.1", None)
+        raise SystemExit("expected ambiguity error")
+    except RuntimeError as exc:
+        assert "Multiple connections" in str(exc) and "10003" in str(exc), exc
+    # unknown host / wrong port -> not connected
+    for args in (("9.9.9.9", None), ("1.1.1.1", 99999)):
+        try:
+            mgr._resolve(*args)
+            raise SystemExit("expected not-connected error")
+        except RuntimeError as exc:
+            assert "No active connection" in str(exc), exc
+
+    items = mgr.list_connections()
+    assert {i["target"] for i in items} == {
+        "1.1.1.1:10003", "1.1.1.1:10004", "2.2.2.2:23"
+    }
+    assert all({"target", "host", "port"} <= set(i) for i in items)
+    print("host:port resolution: OK")
+
+
 async def main() -> None:
     tool_list = await mcp.list_tools()
     tools = {t.name: t for t in tool_list}
     names = sorted(tools)
     print("Registered tools:", names)
+    assert EXPECTED_TOOLS == set(names), (
+        f"tool mismatch: missing {EXPECTED_TOOLS - set(names)}, "
+        f"extra {set(names) - EXPECTED_TOOLS}"
+    )
 
-    expected = {
-        "connect_device",
-        "execute_command",
-        "disconnect_device",
-        "list_connections",
-    }
-    assert expected.issubset(set(names)), f"Missing tools: {expected - set(names)}"
-
-    # Confirm the generated input schema exposes device_type + enable_password.
+    # connect_device: device_type/enable_password present; auth now optional.
     connect = tools["connect_device"]
-    schema = getattr(connect, "parameters", None) or connect.inputSchema
-    params = schema["properties"]
-    print("connect_device params:", sorted(params))
-    assert "device_type" in params
-    assert "enable_password" in params
+    cschema = getattr(connect, "parameters", None) or connect.inputSchema
+    cparams = cschema["properties"]
+    print("connect_device params:", sorted(cparams))
+    assert {"device_type", "enable_password", "port"} <= set(cparams)
+    required = set(cschema.get("required", []))
+    assert "host" in required
+    assert "username" not in required and "password" not in required, required
+
+    # execute_command: interactive + port params surfaced.
+    execute = tools["execute_command"]
+    eschema = getattr(execute, "parameters", None) or execute.inputSchema
+    eparams = eschema["properties"]
+    print("execute_command params:", sorted(eparams))
+    assert {"expect_string", "answer", "port"} <= set(eparams)
 
     check_resolve_platform()
+    check_target()
+    check_console_ring()
+    check_target_resolution()
 
     # Manager error paths (no real device involved).
     mgr = DeviceConnectionManager()

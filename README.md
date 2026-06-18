@@ -19,7 +19,10 @@ platform.
 - **🔄 Persistent Connections**: Maintain long-lived connections for efficient command execution
 - **🎯 Universal Command Execution**: Execute any device command through a single interface
 - **🔐 Mode Management**: Automatic switching between user, enable, and configuration modes
-- **🌐 Multi-Device Support**: Manage multiple devices simultaneously
+- **🌐 Multi-Device Support**: Manage many devices at once — including several behind **one IP on different ports** (console/terminal servers), addressed as `host:port`
+- **✅ Interactive Confirmations**: Answer `(y/n)` / `[confirm]` prompts (e.g. `reboot`, `delete startup-config`) via `expect_string` + `answer`
+- **📜 Console Diagnostics**: Per-connection raw I/O history (`get_console_history`) and live stream reads (`read_console_stream`) for auditing logins, desyncs, and reboots
+- **❓ Inline Help**: Query CLI `?` help with `get_help`
 - **🤖 AI-Friendly**: Natural language command translation through AI assistants
 - **📊 Connection Monitoring**: Track active connections and their status
 
@@ -71,12 +74,15 @@ Establish a connection to a network device.
 
 **Parameters:**
 - `host` (required): IP address or hostname
-- `username` (required): Authentication username
-- `password` (required): Authentication password
+- `username` (optional): Authentication username (omit for unsecured consoles)
+- `password` (optional): Authentication password (omit for unsecured consoles)
 - `device_type` (optional): `cisco_ios` (default), `bdcom`, or any netmiko device type
 - `protocol` (optional): `ssh` or `telnet` (default: `ssh`)
-- `port` (optional): Custom port number
-- `enable_password` (optional): Enable password for privileged mode
+- `port` (optional): Custom port number (default 22 SSH / 23 Telnet). The connection
+  is keyed by `host:port`, so several devices behind one IP stay independent.
+- `enable_password` (optional): Enable password for privileged mode. Many devices
+  (e.g. BDCOM with `aaa authentication enable default none`) need **none** — leave
+  it unset and `enable` mode still works.
 
 **Example (Cisco):**
 ```json
@@ -108,6 +114,9 @@ Execute a command on a connected device.
 - `host` (required): Target device IP/hostname
 - `command` (required): Command to execute
 - `mode` (optional): `user`, `enable`, or `config` (default: `user`)
+- `expect_string` (optional): Regex for an interactive confirmation prompt
+- `answer` (optional): Reply to send when `expect_string` matches
+- `port` (optional): Required only when several devices share an IP
 
 **Example:**
 ```json
@@ -118,14 +127,52 @@ Execute a command on a connected device.
 }
 ```
 
+**Interactive example (BDCOM reboot):**
+```json
+{
+  "host": "192.168.100.34",
+  "port": 10003,
+  "command": "reboot",
+  "mode": "enable",
+  "expect_string": "\\(y/n\\)",
+  "answer": "y"
+}
+```
+
 #### `disconnect_device`
 Disconnect from a device.
 
 **Parameters:**
 - `host` (required): Device IP/hostname to disconnect
+- `port` (optional): Required only when several devices share an IP
 
 #### `list_connections`
-List all active connections (host, device_type, protocol, current mode, timestamps).
+List all active connections (`target` = `host:port`, host, port, device_type,
+protocol, current mode, timestamps).
+
+#### `get_console_history`
+Return the last N lines of raw console I/O captured for a connection — useful for
+auditing logins, prompt-matching failures, and reboots.
+
+**Parameters:** `host` (required), `limit` (optional, default 100), `port` (optional).
+
+> ⚠️ History can contain sensitive output (e.g. a config dump exposes plaintext
+> credentials). Treat it as sensitive.
+
+#### `read_console_stream`
+Read live console output **without sending a command** — accumulates whatever the
+device emits until a pattern matches or the timeout elapses. Handy for watching a
+device reboot back to its login prompt.
+
+**Parameters:** `host` (required), `expect_pattern` (optional regex),
+`timeout` (optional seconds, default 10, capped at 120), `port` (optional).
+
+#### `get_help`
+Send `command_prefix + '?'` and return the device's inline CLI help, then clear the
+input line so the next command runs cleanly.
+
+**Parameters:** `host` (required), `command_prefix` (optional, e.g. `"show "`),
+`port` (optional).
 
 ### 💡 Usage Examples
 
@@ -155,6 +202,17 @@ The AI will execute multiple commands:
 - "show ip interface brief"
 - "show interface status"
 
+#### Multiple devices behind one console server
+When a terminal/console server exposes several devices on one IP at different
+ports, connect to each with its `port`, then address tools by `host` + `port`:
+```
+connect_device  host=192.168.100.34  port=10003  device_type=bdcom  protocol=telnet
+connect_device  host=192.168.100.34  port=10004  device_type=bdcom  protocol=telnet
+execute_command host=192.168.100.34  port=10003  command="show version"
+```
+`list_connections` shows each as a distinct `target` (`192.168.100.34:10003`,
+`192.168.100.34:10004`). If a host has only one connection, `port` can be omitted.
+
 ### 🔧 Supported Commands
 
 This server is a generic command executor — it forwards **any** command the
@@ -176,14 +234,30 @@ CLI. The differences it handles (verified against the BDCOM Switch L3 docs):
 |---|---|---|---|
 | Enter global config | `configure terminal` | `config` | custom driver |
 | Config prompt | `host(config)#` | `Switch_config#` (no parens) | custom driver |
-| Exit config | `end` | Ctrl-Z / `exit` / `quit` | custom driver |
-| Privileged mode | `enable` | `enable` | inherited |
-| Disable paging | `terminal length 0` | `terminal length 0` | inherited |
-| Enable password | `enable password` | `enable password` | inherited |
+| Exit config | `end` | Ctrl-Z (device doesn't echo it) | custom driver |
+| Exit privileged | `disable` | `exit` (`Switch#` → `Switch>`) | custom driver |
+| Set terminal width | `terminal width 511` | *(unsupported)* | custom driver (skipped) |
+| Disable paging | `terminal length 0` (any mode) | `terminal length 0` **(enable mode only)** | custom driver (in enable mode) |
+| Enter enable | `enable` (+secret) | `enable` (often **no** secret) | inherited |
 
 Select it per connection with `"device_type": "bdcom"` (or `protocol: "telnet"`
 for Telnet). Mode names (`user` / `enable` / `config`) map to BDCOM's user /
 management / global-configuration modes.
+
+**Why a custom session setup:** BDCOM rejects `terminal width` and only accepts
+`terminal length 0` (disable paging) in privileged mode. netmiko's stock Cisco
+setup runs both at login in **user** mode, which fails *and leaves paging on* — so
+the next large `show` stalls on `--More--` and desyncs the session. The BDCOM
+driver instead enters enable mode and disables paging there.
+
+**Field tips (from real-hardware testing):**
+- Use `device_type: "bdcom"` for BDCOM switches — required for config-mode ops.
+- `enable` needs no password on a default BDCOM (`aaa authentication enable default
+  none`); just omit `enable_password`.
+- A config dump exposes plaintext credentials — treat `show running-config` output
+  (and `get_console_history`) as sensitive.
+- If a session ever desyncs, `disconnect_device` then `connect_device` for a clean
+  one rather than retrying the failing command.
 
 ### 🔒 Security Notes
 
@@ -267,25 +341,41 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ### 🛠 可用工具
 
+连接以 `host:port` 为键，因此同一 IP、不同端口的多台设备（控制台/终端服务器）互不影响；
+当某主机只有一个连接时，工具的 `port` 参数可省略。
+
 #### `connect_device`
 建立到网络设备的连接（参数 `device_type` 选择平台：`cisco_ios` 默认 / `bdcom` / 任意 netmiko 类型）。
+`username` / `password` 可选（用于无认证的控制台）；默认 BDCOM 进入 `enable` 无需密码。
 
 #### `execute_command`
-在已连接的设备上执行命令。
+在已连接的设备上执行命令。支持 `expect_string` + `answer` 应答交互式 `(y/n)` 确认；
+`port` 仅在同一 IP 有多台设备时需要。
 
 #### `disconnect_device`
-断开与设备的连接。
+断开与设备的连接（同一 IP 多设备时需指定 `port`）。
 
 #### `list_connections`
-列出所有活动连接。
+列出所有活动连接（含 `target` = `host:port`）。
+
+#### `get_console_history`
+返回某连接最近 N 行原始控制台 I/O，用于审计登录、提示符不匹配和重启。可能包含明文凭据，请按敏感数据处理。
+
+#### `read_console_stream`
+不发送命令，直接读取实时控制台输出，直到匹配正则或超时（适合观察设备重启回到登录提示符）。
+
+#### `get_help`
+发送 `command_prefix + '?'` 返回设备的内联 CLI 帮助，并清理输入行。
 
 ### 📟 BDCOM 说明
 
 netmiko 没有内置 BDCOM 驱动，本服务器提供了一个小型自定义驱动
 （[`device_mcp/bdcom.py`](device_mcp/bdcom.py)）来适配 BDCOM 的 CLI：进入全局配置用
 `config`（而非 `configure terminal`），配置提示符为 `Switch_config#`（无括号），用
-Ctrl-Z 退出配置模式。`enable` 特权模式、`terminal length 0` 关闭分页、`enable
-password` 均与 Cisco 兼容。连接时设置 `"device_type": "bdcom"` 即可。
+Ctrl-Z 退出配置模式，特权模式用 `exit` 退出。BDCOM 不支持 `terminal width`，且
+`terminal length 0`（关闭分页）仅在特权模式可用——因此驱动会先进入 enable 模式再关闭分页，
+避免大输出在 `--More--` 处卡住导致会话错乱。默认 BDCOM `enable` 无需密码。连接时设置
+`"device_type": "bdcom"` 即可。
 
 ### 📝 许可证
 

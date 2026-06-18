@@ -1,12 +1,18 @@
 """Device MCP Server (Python / FastMCP).
 
 A FastMCP server for managing network devices (Cisco IOS, BDCOM, and any other
-netmiko-supported platform) over SSH or Telnet. Exposes four tools:
+netmiko-supported platform) over SSH or Telnet. Exposes seven tools:
 
     * connect_device
     * execute_command
     * disconnect_device
     * list_connections
+    * get_console_history
+    * read_console_stream
+    * get_help
+
+Connections are addressed by host, plus a ``port`` that is required only when
+several devices share an IP (a console/terminal server).
 """
 
 from __future__ import annotations
@@ -22,6 +28,12 @@ from .connection import DeviceConnectionManager
 mcp = FastMCP("device-mcp")
 _manager = DeviceConnectionManager()
 
+# Reused field description: identifies which connection a tool acts on.
+_PORT_DESC = (
+    "Port of the target connection. Required only when several devices share an "
+    "IP (a console/terminal server); omit it when the host has a single connection."
+)
+
 
 def _json(payload: object) -> str:
     return json.dumps(payload, indent=2, default=str)
@@ -30,8 +42,14 @@ def _json(payload: object) -> str:
 @mcp.tool
 def connect_device(
     host: Annotated[str, Field(description="IP address or hostname of the device")],
-    username: Annotated[str, Field(description="Username for authentication")],
-    password: Annotated[str, Field(description="Password for authentication")],
+    username: Annotated[
+        Optional[str],
+        Field(description="Username for authentication (optional for unsecured consoles)"),
+    ] = None,
+    password: Annotated[
+        Optional[str],
+        Field(description="Password for authentication (optional for unsecured consoles)"),
+    ] = None,
     device_type: Annotated[
         str,
         Field(
@@ -50,12 +68,14 @@ def connect_device(
     ] = None,
     enable_password: Annotated[
         Optional[str],
-        Field(description="Enable password for privileged mode (optional)"),
+        Field(description="Enable password for privileged mode (optional; many "
+              "devices need none)"),
     ] = None,
 ) -> str:
     """Connect to a network device via SSH or Telnet.
 
-    Establishes a persistent connection for command execution.
+    Establishes a persistent connection for command execution. The connection is
+    keyed by ``host:port``, so multiple devices behind one IP stay independent.
     """
     result = _manager.connect(
         host=host,
@@ -88,13 +108,26 @@ def execute_command(
             "or config (configuration)"
         ),
     ] = "user",
+    expect_string: Annotated[
+        Optional[str],
+        Field(description="Regex pattern to expect for an interactive command "
+              "confirmation, e.g. '[y/n]' or '\\(y/n\\)' (optional)"),
+    ] = None,
+    answer: Annotated[
+        Optional[str],
+        Field(description="Answer to send in response to the confirmation prompt "
+              "(optional; pair with expect_string)"),
+    ] = None,
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:
     """Execute a command on a connected network device.
 
     The device must be connected first using ``connect_device``.
     """
     try:
-        return _manager.execute_command(host, command, mode)
+        return _manager.execute_command(
+            host, command, mode, expect_string, answer, port
+        )
     except Exception as exc:  # noqa: BLE001 - return AI-friendly error text
         return f"Error: {exc}"
 
@@ -105,15 +138,88 @@ def disconnect_device(
         str,
         Field(description="IP address or hostname of the device to disconnect"),
     ],
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:
     """Disconnect from a network device and clean up the connection."""
-    return _json(_manager.disconnect(host))
+    return _json(_manager.disconnect(host, port))
 
 
 @mcp.tool
 def list_connections() -> str:
-    """List all active network device connections."""
+    """List all active network device connections (with their host:port targets)."""
     return _json(_manager.list_connections())
+
+
+@mcp.tool
+def get_console_history(
+    host: Annotated[
+        str, Field(description="IP address or hostname of the connected device")
+    ],
+    limit: Annotated[
+        int,
+        Field(description="Number of most recent console lines to return (default 100)"),
+    ] = 100,
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+) -> str:
+    """Return the last N lines of raw console I/O captured for a connection.
+
+    Useful for auditing logins, prompt-matching failures, and reboots. Note the
+    history may contain sensitive output (e.g. plaintext credentials in a config).
+    """
+    try:
+        return _manager.get_console_history(host, limit, port)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error: {exc}"
+
+
+@mcp.tool
+def read_console_stream(
+    host: Annotated[
+        str, Field(description="IP address or hostname of the connected device")
+    ],
+    expect_pattern: Annotated[
+        Optional[str],
+        Field(description="Regex to stop reading on (e.g. a login prompt). If "
+              "omitted, reads until the timeout."),
+    ] = None,
+    timeout: Annotated[
+        float,
+        Field(description="Max seconds to read (capped at 120). Default 10."),
+    ] = 10.0,
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+) -> str:
+    """Read live console output without sending a command.
+
+    Accumulates whatever the device emits until ``expect_pattern`` matches or the
+    timeout elapses - handy for watching a reboot back to the login prompt.
+    """
+    try:
+        return _manager.read_console_stream(host, expect_pattern, timeout, port)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error: {exc}"
+
+
+@mcp.tool
+def get_help(
+    host: Annotated[
+        str, Field(description="IP address or hostname of the connected device")
+    ],
+    command_prefix: Annotated[
+        str,
+        Field(description='Text to request help for, e.g. "show " or "" for '
+              "top-level help"),
+    ] = "",
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+) -> str:
+    """Send '?' inline help for a command prefix and return the device's options.
+
+    Writes ``command_prefix + '?'`` without a newline (as the CLI expects), then
+    clears the input line so the next command runs cleanly. Best effort.
+    """
+    try:
+        return _manager.get_help(host, command_prefix, port)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error: {exc}"
 
 
 def main() -> None:

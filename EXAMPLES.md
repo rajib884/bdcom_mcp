@@ -19,7 +19,8 @@ Cisco IOS (default `device_type`):
 }
 ```
 
-BDCOM switch:
+BDCOM switch (telnet; a default BDCOM `enable` needs no password, so
+`enable_password` is omitted):
 ```json
 {
   "tool": "connect_device",
@@ -28,9 +29,22 @@ BDCOM switch:
     "username": "admin",
     "password": "secret123",
     "device_type": "bdcom",
-    "enable_password": "enable123"
+    "protocol": "telnet"
   }
 }
+```
+
+Several devices behind one console/terminal server (same IP, different ports) -
+each is a distinct `host:port` connection:
+```json
+{ "tool": "connect_device",
+  "arguments": { "host": "192.168.100.34", "port": 10003, "username": "admin",
+                 "password": "admin", "device_type": "bdcom", "protocol": "telnet" } }
+```
+```json
+{ "tool": "connect_device",
+  "arguments": { "host": "192.168.100.34", "port": 10004, "username": "admin",
+                 "password": "admin", "device_type": "bdcom", "protocol": "telnet" } }
 ```
 
 ### 2. Execute Basic Show Commands
@@ -84,6 +98,46 @@ BDCOM switch:
 > The server enters the right mode automatically (e.g. `config` runs
 > `configure terminal` on Cisco IOS and `config` on BDCOM).
 
+### 4. Interactive Commands (confirmations)
+
+Commands that wait for a `(y/n)` / `[confirm]` answer (e.g. `reboot`,
+`delete startup-config`) use `expect_string` (a regex) + `answer`. Include `port`
+when the device shares its IP with others:
+```json
+{
+  "tool": "execute_command",
+  "arguments": {
+    "host": "192.168.100.34",
+    "port": 10003,
+    "command": "reboot",
+    "mode": "enable",
+    "expect_string": "\\(y/n\\)",
+    "answer": "y"
+  }
+}
+```
+
+### 5. Console Diagnostics
+
+Audit the raw I/O captured for a connection (logins, desyncs, reboots):
+```json
+{ "tool": "get_console_history",
+  "arguments": { "host": "192.168.100.34", "port": 10003, "limit": 200 } }
+```
+
+Watch a device reboot back to its login prompt without sending a command:
+```json
+{ "tool": "read_console_stream",
+  "arguments": { "host": "192.168.100.34", "port": 10003,
+                 "expect_pattern": "Username:", "timeout": 120 } }
+```
+
+Ask the CLI what `show` subcommands exist (`?` help):
+```json
+{ "tool": "get_help",
+  "arguments": { "host": "192.168.100.34", "port": 10003, "command_prefix": "show " } }
+```
+
 ## Natural Language Examples for AI Assistants
 
 ### Network Troubleshooting
@@ -133,14 +187,14 @@ command the device accepts, so vendor-specific commands work too.
 - `show running-config` - Current running configuration
 - `show startup-config` - Startup configuration
 - `show ip interface brief` - IP interface summary
-- `show interface status` - Interface status summary
+- `show interface brief` - Interface status summary (BDCOM)
 - `show vlan brief` - VLAN information
 - `show ip route` - Routing table
 - `show arp` - ARP table
 - `show mac address-table` - MAC address table
 - `show inventory` - Hardware inventory
-- `show processes cpu` - CPU utilization
-- `show memory` - Memory utilization
+- `show cpu` - CPU utilization (BDCOM; Cisco uses `show processes cpu`)
+- `show flash` / `dir` - Flash contents
 
 ### Configuration Commands
 - `interface <interface-name>` - Enter interface configuration
@@ -171,17 +225,20 @@ command the device accepts, so vendor-specific commands work too.
 }
 ```
 
-This shows all active connections (host, device_type, protocol, current mode, timestamps).
+This shows all active connections, each with its `target` (`host:port`), host,
+port, device_type, protocol, current mode, and timestamps.
 
 ### Disconnect from Device
 ```json
 {
   "tool": "disconnect_device",
   "arguments": {
-    "host": "192.168.1.1"
+    "host": "192.168.100.34",
+    "port": 10003
   }
 }
 ```
+`port` is required only when several devices share the IP; otherwise just pass `host`.
 
 ## Error Handling
 
@@ -191,5 +248,6 @@ The MCP server provides detailed error messages for:
 - Command execution errors
 - Network timeouts
 - Unsupported `device_type` values
+- Ambiguous targets (several devices on one IP without a `port`)
 
 All errors are returned in a structured format for easy parsing by AI assistants.
