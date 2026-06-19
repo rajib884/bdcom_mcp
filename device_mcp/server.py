@@ -126,16 +126,25 @@ def execute_command(
               "(optional; pair with expect_string)"),
     ] = None,
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+    raw: Annotated[
+        bool,
+        Field(description="Bypass mode switching and prompt detection, driving the "
+              "channel directly. Needed at prompts netmiko doesn't know, e.g. the "
+              "bootloader 'monitor#' shell (where a normal reboot times out and is "
+              "never sent). With raw, 'mode' is ignored; use expect_string/answer for "
+              "a confirmation. Default false."),
+    ] = False,
 ) -> str:
     """Execute a command on a connected network device.
 
     The device must be connected first using ``connect_device``. Returns the raw
     command output followed by a ``[device-mcp]`` footer line reporting any device
-    error and where the CLI ended up (prompt + mode).
+    error and where the CLI ended up (prompt + mode). To reboot from the ``monitor#``
+    shell, pass ``raw=true`` with ``expect_string="\\(y/n\\)"`` and ``answer="y"``.
     """
     try:
         return _manager.execute_command(
-            host, command, mode, expect_string, answer, port
+            host, command, mode, expect_string, answer, port, raw
         )
     except Exception as exc:  # noqa: BLE001 - return AI-friendly error text
         return f"Error: {exc}"
@@ -369,10 +378,17 @@ def recover_firmware(
         str, Field(description="IP address or hostname of the connected device")
     ],
     image_url: Annotated[
-        str, Field(description="Firmware image source (tftp:/ftp: URL)")
+        str,
+        Field(description="Firmware image as a tftp: source — the bootloader monitor "
+              "'copy' only accepts tftp: (an ftp:// URL is rejected) and caps the name "
+              "at 60 chars. This fleet's relay shorthand is "
+              "'tftp:f::<last-chars-of-ftp-dir>/<file>', e.g. "
+              "'tftp:f::53/BD_3954_interAptiv_2.2.0F_154634.bin' for FTP dir "
+              "/BDCOM0053/."),
     ],
     server: Annotated[
-        str, Field(description="TFTP/FTP server IP appended to the 'copy' command")
+        str, Field(description="TFTP/FTP-relay server IP appended to the 'copy' "
+              "command (the gateway that fronts the FTP server)")
     ],
     monitor_ip: Annotated[
         str,

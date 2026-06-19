@@ -154,6 +154,23 @@ _DIALECT_HINTS: list[tuple[re.Pattern[str], str]] = [
 _CLI_PROMPT_RE = re.compile(r"[>#]\s*$")
 _CONFIRM_YN_RE = re.compile(r"\(y/n\)")
 _TRANSFER_OK_RE = re.compile(r"(?i)\bsuccessfully\b")
+# A copy streams a long run of '#' progress markers (so the redrawn prompt can't be
+# the stop condition - a progress '#' would match it). Stop only on a real outcome:
+# the success line, or a known failure phrase the device prints.
+_TRANSFER_DONE_RE = re.compile(
+    r"(?i)\bsuccessfully\b"
+    r"|Parameter invalid"
+    r"|file name is too long"
+    r"|%Err"
+    r"|Unknown command"
+    r"|^\s*error,"
+    r"|does not exist"
+    r"|No such file"
+    r"|operation failed",
+    re.MULTILINE,
+)
+# BDCOM bootloader 'copy' rejects a tftp: source filename longer than this.
+_TFTP_NAME_LIMIT = 60
 _RTC_TEST_RE = re.compile(r"RTC Test")
 # A hidden-menu line offering a reboot, e.g. "4   reboot" or
 # "9   core dump and reboot"; group 1 is the single-keystroke option to send.
@@ -524,9 +541,20 @@ class DeviceConnectionManager:
                 else:
                     connection = ConnectHandler(device_type=dispatch, **params)
             except NetmikoAuthenticationException as exc:
-                return self._failure(host, f"Authentication failed: {exc}", port=resolved_port)
+                # Surface what the device actually sent (the login banner/prompts) so
+                # the caller can tell a bad password from a banner-only or
+                # specific-account login, instead of a bare "Login failed".
+                transcript = console.text(20).strip()
+                msg = f"Authentication failed: {exc}"
+                if transcript:
+                    msg += f"\n--- last console output ---\n{transcript}"
+                return self._failure(host, msg, port=resolved_port)
             except NetmikoTimeoutException as exc:
-                return self._failure(host, f"Connection timed out: {exc}", port=resolved_port)
+                transcript = console.text(20).strip()
+                msg = f"Connection timed out: {exc}"
+                if transcript:
+                    msg += f"\n--- last console output ---\n{transcript}"
+                return self._failure(host, msg, port=resolved_port)
             except Exception as exc:  # noqa: BLE001 - surface any transport error
                 return self._failure(host, f"{type(exc).__name__}: {exc}", port=resolved_port)
 
@@ -564,12 +592,20 @@ class DeviceConnectionManager:
         expect_string: str | None = None,
         answer: str | None = None,
         port: int | None = None,
+        raw: bool = False,
     ) -> str:
         """Run a command and return its raw output plus a ``[device-mcp]`` footer.
 
         The footer reports whether the device rejected the command (a *device
         error*, distinct from a transport failure) and where the CLI ended up
         (prompt + mode), so the caller can react without re-deriving session state.
+
+        Set ``raw=True`` to bypass mode switching and netmiko's prompt detection and
+        drive the channel directly - required at prompts netmiko doesn't know, e.g.
+        the bootloader ``monitor#`` shell, where the normal path waits forever for the
+        device's usual ``Switch.*`` prompt and the command is never even sent. With
+        ``raw`` the ``mode`` argument is ignored; pass ``expect_string`` to stop on a
+        pattern (and ``answer`` to reply to a confirmation).
         """
         with self._lock:
             conn = self._connections[self._resolve(host, port)]
@@ -580,6 +616,8 @@ class DeviceConnectionManager:
 
             net = conn.connection
             conn.last_activity = _now()
+            if raw:
+                return self._execute_raw(conn, command, expect_string, answer)
             try:
                 self._switch_mode(conn, mode)
                 if mode == "config":
@@ -632,6 +670,43 @@ class DeviceConnectionManager:
                 device_error=device_error, prompt=prompt, state=state,
                 hint=_dialect_hint(command) if device_error else None,
             )
+
+    def _execute_raw(
+        self,
+        conn: DeviceConnection,
+        command: str,
+        expect_string: str | None,
+        answer: str | None,
+    ) -> str:
+        """Send ``command`` with raw channel I/O - no mode switching, no reliance on
+        netmiko's cached prompt. Caller holds the lock. Used for the ``monitor#`` shell
+        (and any prompt netmiko can't match), e.g. the final reboot after a recovery
+        flash."""
+        net = conn.connection
+        try:
+            try:
+                net.read_channel()  # drain residue
+            except Exception:  # noqa: BLE001
+                pass
+            pat = re.compile(expect_string) if expect_string else None
+            output = _send_and_read(net, command, pat, timeout=_EXEC_READ_TIMEOUT, idle=2.0)
+            if expect_string and answer is not None:
+                # Answer the confirmation, then drain the aftermath (e.g. the reboot
+                # banner) - the device may not return a clean prompt.
+                output += "\n" + _send_and_read(net, answer, None, timeout=8.0, idle=1.5)
+        except Exception as exc:  # noqa: BLE001
+            prompt, state = _describe_session(net, conn.console)
+            return _footer(failure=f"{type(exc).__name__}: {exc}",
+                           prompt=prompt, state=state, hint=_dialect_hint(command))
+        prompt, state = _describe_session(net, conn.console)
+        conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
+        if state in ("awaiting_login", "session_terminated"):
+            return output.rstrip("\n") + "\n\n" + _footer(
+                terminated=True, prompt=prompt, state=state, hint=_dialect_hint(command))
+        device_error = _detect_device_error(output)
+        return output.rstrip("\n") + "\n\n" + _footer(
+            device_error=device_error, prompt=prompt, state=state,
+            hint=_dialect_hint(command) if device_error else None)
 
     # ------------------------------------------------------------------ configure
     def configure(
@@ -828,18 +903,31 @@ class DeviceConnectionManager:
         source: str,
         destination: str,
         server: str | None = None,
-        timeout: float = 120.0,
+        timeout: float = 300.0,
         port: int | None = None,
     ) -> str:
         """Run a BDCOM ``copy`` and report whether the transfer succeeded.
 
-        Builds ``copy <source> <destination> [server]`` and waits for the prompt to
-        return (transfer done) or the timeout. ``flash:`` paths, ``tftp:`` /
-        ``ftp://user:pass@host/dir/file`` URLs, and BDCOM's shorthand all pass
-        through unchanged. Works in CLI/enable mode and in the bootloader ``monitor``
-        shell (plain ``copy``). Mirrors the ``download_configs.py`` / ``tftp_script.py``
-        copy step.
+        Builds ``copy <source> <destination> [server]`` and reads until the device
+        reports an outcome (``successfully`` or a failure phrase) or the timeout. The
+        copy streams a long run of ``#`` progress markers for a large image, so the
+        redrawn prompt is *not* the stop condition - waiting on it returns mid-stream
+        and misreports a good transfer as failed. ``flash:`` paths and ``tftp:``
+        sources pass through unchanged; note the bootloader ``monitor`` ``copy`` only
+        accepts ``tftp:`` and limits the source name to 60 chars. Mirrors the
+        ``download_configs.py`` / ``tftp_script.py`` copy step.
         """
+        # Fail fast on the device's documented 60-char tftp source-name limit
+        # instead of rebooting first and letting the device reject the command.
+        if source.lower().startswith("tftp:"):
+            name = source[len("tftp:"):]
+            if len(name) > _TFTP_NAME_LIMIT:
+                return _footer(
+                    failure=f"tftp source name is {len(name)} chars; this device's "
+                    f"bootloader 'copy' allows at most {_TFTP_NAME_LIMIT}",
+                    state="unknown",
+                )
+
         cmd = f"copy {source} {destination}"
         if server:
             cmd += f" {server}"
@@ -856,7 +944,13 @@ class DeviceConnectionManager:
                     net.read_channel()  # drain residue before issuing the copy
                 except Exception:  # noqa: BLE001
                     pass
-                out = _send_and_read(net, cmd, _CLI_PROMPT_RE, timeout=timeout, idle=3.0)
+                out = _send_and_read(net, cmd, _TRANSFER_DONE_RE, timeout=timeout)
+                # Large images stream for a while; if the first wait returned without
+                # a verdict, poll once more before declaring failure (issue #3).
+                if not _TRANSFER_DONE_RE.search(out):
+                    out += _read_until(
+                        net, _TRANSFER_DONE_RE, timeout=min(120.0, timeout)
+                    )
             except Exception as exc:  # noqa: BLE001
                 prompt, state = _describe_session(net, conn.console)
                 return _footer(failure=f"{type(exc).__name__}: {exc}",
@@ -864,13 +958,20 @@ class DeviceConnectionManager:
             prompt, state = _describe_session(net, conn.console)
 
         device_error = _detect_device_error(out)
-        if device_error:
-            footer = _footer(device_error=device_error, prompt=prompt, state=state)
-        elif _TRANSFER_OK_RE.search(out):
+        if _TRANSFER_OK_RE.search(out):
             footer = _footer(note="transfer ok", prompt=prompt, state=state)
-        else:
-            footer = _footer(failure="transfer did not confirm success",
+        elif device_error:
+            footer = _footer(device_error=device_error, prompt=prompt, state=state)
+        elif _TRANSFER_DONE_RE.search(out):
+            failed = _TRANSFER_DONE_RE.search(out).group(0).strip()
+            footer = _footer(failure=f"transfer rejected: {failed}",
                              prompt=prompt, state=state)
+        else:
+            footer = _footer(
+                failure="transfer did not confirm success (timed out waiting "
+                "for the device's confirmation)",
+                prompt=prompt, state=state,
+            )
         return out.rstrip("\n") + "\n\n" + footer
 
     def upgrade_firmware(
@@ -890,7 +991,7 @@ class DeviceConnectionManager:
         transfer did not confirm success.
         """
         transfer = self.transfer_file(
-            host, image_url, f"flash:{flash_name}", server, timeout=300.0, port=port
+            host, image_url, f"flash:{flash_name}", server, timeout=600.0, port=port
         )
         if not _TRANSFER_OK_RE.search(transfer):
             return transfer  # footer already explains the failure; don't reboot
@@ -988,10 +1089,26 @@ class DeviceConnectionManager:
         """End-to-end monitor-mode recovery (the shape of the four ``monitor&*.py``).
 
         ``enter_monitor_mode`` -> assign ``ip addr`` in the monitor shell -> recover
-        the image with ``transfer_file`` -> ``reboot`` into it (normal boot, **no**
-        Ctrl-P this time). Aborts if monitor mode isn't reached or the flash transfer
-        doesn't confirm.
+        the image with ``transfer_file`` -> ``reboot`` into it (raw, **no** Ctrl-P this
+        time). Aborts if monitor mode isn't reached or the flash transfer doesn't
+        confirm.
+
+        ``image_url`` must be a ``tftp:`` source: the bootloader ``monitor`` ``copy``
+        only understands ``tftp:`` (an ``ftp://`` URL is rejected as ``Parameter
+        invalid``), and the source name is capped at 60 chars. This network's relay
+        shorthand is ``tftp:f::<last-chars-of-ftp-dir>/<file>`` (e.g.
+        ``tftp:f::53/BD_3954_interAptiv_2.2.0F_154634.bin`` for FTP dir
+        ``/BDCOM0053/``), pointed at the ``server`` (the TFTP->FTP gateway IP).
         """
+        # Fail fast before a reboot cycle: monitor 'copy' is tftp-only (issue #2).
+        if not image_url.lower().startswith("tftp:"):
+            scheme = image_url.split(":", 1)[0] if ":" in image_url else image_url
+            return _footer(
+                failure=f"monitor-mode 'copy' only supports tftp: sources (got "
+                f"'{scheme}:'); use the tftp relay form, e.g. tftp:f::53/<file>.bin",
+                state="unknown",
+            )
+
         out = self.enter_monitor_mode(host, port=port)
         if "entered monitor mode" not in out:
             return out  # footer explains why monitor mode wasn't reached
@@ -1006,7 +1123,7 @@ class DeviceConnectionManager:
             )
 
         transfer = self.transfer_file(
-            host, image_url, f"flash:{flash_name}", server, timeout=300.0, port=port
+            host, image_url, f"flash:{flash_name}", server, timeout=600.0, port=port
         )
         out += "\n--- transfer ---\n" + transfer
         if not _TRANSFER_OK_RE.search(transfer):

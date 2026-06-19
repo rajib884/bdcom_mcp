@@ -353,26 +353,66 @@ class _FakeLoginNet:
 
 
 class _FakeTransfer:
-    """A netmiko stand-in that replies to a 'copy' with a scripted transfer log."""
+    """A netmiko stand-in that streams a 'copy' reply in chunks.
+
+    Chunks are delivered one per ``read_channel`` after the copy is sent, so a test
+    can put the '#' progress markers in an early chunk and the outcome line in a
+    later one - proving the transfer wait doesn't stop on a progress '#'.
+    """
 
     RETURN = "\n"
 
-    def __init__(self, response: str) -> None:
-        self._response = response
-        self._buf = ""
+    def __init__(self, chunks: list[str]) -> None:
+        self._chunks = list(chunks)
+        self._queue: list[str] = []
         self.sent: list[str] = []
 
     def write_channel(self, data: str) -> None:
         self.sent.append(data)
         if data.strip().startswith("copy"):
-            self._buf += self._response
+            self._queue = list(self._chunks)
+
+    def read_channel(self) -> str:
+        return self._queue.pop(0) if self._queue else ""
+
+    def find_prompt(self) -> str:
+        return "monitor#"
+
+
+class _FakeMonitor:
+    """A netmiko stand-in at the bootloader 'monitor#' shell.
+
+    The netmiko-prompt methods raise (as the real driver does at monitor#, where its
+    cached 'Switch.*' prompt never appears), so only execute_command(raw=True) works.
+    """
+
+    RETURN = "\n"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self.sent: list[str] = []
+
+    def write_channel(self, data: str) -> None:
+        self.sent.append(data)
+        if data.strip() == "reboot":
+            self._buf += "\nDo you want to reboot the Switch(y/n)?"
+        elif data.strip() == "y":
+            self._buf += "y\nPlease wait...\n"
 
     def read_channel(self) -> str:
         data, self._buf = self._buf, ""
         return data
 
     def find_prompt(self) -> str:
-        return "Switch#"
+        return "monitor#"
+
+    def _stale_prompt(self, *a, **k):
+        raise RuntimeError("ReadTimeout: Pattern not detected: 'Switch.*'")
+
+    check_enable_mode = _stale_prompt
+    check_config_mode = _stale_prompt
+    send_command = _stale_prompt
+    send_command_timing = _stale_prompt
 
 
 class _FakeBoot:
@@ -444,17 +484,59 @@ def check_session_terminated() -> None:
 
 def check_transfer_file() -> None:
     mgr = DeviceConnectionManager()
-    ok_log = ("copy tftp:img.bin flash:switch.bin 1.1.1.1\nTFTP:\n!!!!!\n"
-              "successfully receive 8027243 bytes.\nSwitch#")
-    _attach(mgr, "h:23", _FakeTransfer(ok_log))
-    res = mgr.transfer_file("h", "tftp:img.bin", "flash:switch.bin", "1.1.1.1", port=23)
+    progress = ("#" * 70 + "\n") * 3  # a run of progress markers, like a real copy
+    # Success: the '#' progress arrives before the outcome line and must NOT be
+    # mistaken for a finished transfer (the old _CLI_PROMPT_RE bug, issue #3).
+    _attach(mgr, "h:23", _FakeTransfer(
+        [progress, "TFTP:successfully receive 16156 blocks, 8271420 bytes\n", "monitor#"]
+    ))
+    res = mgr.transfer_file("h", "tftp:f::53/img.bin", "flash:switch.bin", "1.1.1.1", port=23)
     assert "[device-mcp] transfer ok" in res, res
 
-    fail_log = "copy tftp:img.bin flash:switch.bin 1.1.1.1\nTFTP:\ntimeout, aborted\nSwitch#"
-    _attach(mgr, "h:24", _FakeTransfer(fail_log))
-    res2 = mgr.transfer_file("h", "tftp:img.bin", "flash:switch.bin", "1.1.1.1", port=24)
-    assert "FAILED: transfer did not confirm" in res2, res2
+    # Device-rejected transfer surfaces the actual reason.
+    _attach(mgr, "h:24", _FakeTransfer([progress, "Parameter invalid\n", "monitor#"]))
+    res2 = mgr.transfer_file("h", "tftp:bad", "flash:switch.bin", "1.1.1.1", port=24)
+    assert "transfer rejected: Parameter invalid" in res2, res2
+
+    # No confirmation before the timeout -> a clear timeout failure (small timeout).
+    _attach(mgr, "h:25", _FakeTransfer([progress]))
+    res3 = mgr.transfer_file("h", "tftp:img", "flash:switch.bin", "1.1.1.1",
+                             timeout=1.0, port=25)
+    assert "did not confirm success" in res3, res3
+
+    # 60-char tftp source-name limit is caught client-side, before any I/O.
+    _attach(mgr, "h:26", _FakeTransfer([]))
+    res4 = mgr.transfer_file("h", "tftp:" + "A" * 61, "flash:switch.bin", port=26)
+    assert "at most 60" in res4, res4
     print("transfer_file: OK")
+
+
+def check_execute_raw_monitor() -> None:
+    """At monitor#, the normal path fails (stale 'Switch.*' prompt); raw works."""
+    mgr = DeviceConnectionManager()
+    _attach(mgr, "h:23", _FakeMonitor())
+    nonraw = mgr.execute_command("h", "reboot", expect_string=r"\(y/n\)",
+                                 answer="y", port=23)
+    assert "FAILED" in nonraw, nonraw          # demonstrates the stuck-prompt bug
+
+    _attach(mgr, "h:24", _FakeMonitor())
+    raw = mgr.execute_command("h", "reboot", expect_string=r"\(y/n\)", answer="y",
+                              port=24, raw=True)
+    assert "Please wait" in raw, raw           # the reboot actually ran
+    assert "now: monitor#" in raw, raw
+    print("execute_command raw (monitor): OK")
+
+
+def check_recover_firmware_guard() -> None:
+    """recover_firmware rejects a non-tftp source before any reboot cycle."""
+    mgr = DeviceConnectionManager()
+    _attach(mgr, "h:23", _FakeMonitor())
+    res = mgr.recover_firmware(
+        "h", "ftp://share:shared@1.2.3.4/dir/img.bin", "1.1.1.1", "170.170.170.43",
+        port=23,
+    )
+    assert "only supports tftp:" in res, res
+    print("recover_firmware tftp guard: OK")
 
 
 def check_enter_monitor_mode() -> None:
@@ -515,6 +597,8 @@ async def main() -> None:
     check_session_terminated()
     check_configure()
     check_transfer_file()
+    check_execute_raw_monitor()
+    check_recover_firmware_guard()
     check_enter_monitor_mode()
     check_get_help_clears_line()
     check_get_help_normalize()

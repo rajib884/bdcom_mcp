@@ -125,6 +125,11 @@ up (see [Result footer](#-result-footer)).
   multi-step config prefer `configure_device`.
 - `expect_string` (optional): Regex for an interactive confirmation prompt
 - `answer` (optional): Reply to send when `expect_string` matches
+- `raw` (optional): Bypass mode switching and prompt detection, driving the channel
+  directly. Needed at prompts netmiko doesn't know — notably the bootloader
+  `monitor#` shell, where the normal path waits for the device's usual `Switch.*`
+  prompt and the `reboot` is never even sent. To reboot from monitor mode:
+  `raw=true`, `expect_string="\\(y/n\\)"`, `answer="y"`.
 - `port` (optional): Required only when several devices share an IP
 
 **Example:**
@@ -244,12 +249,19 @@ Returns the boot transcript and a `now: monitor#` footer on success.
 #### `recover_firmware`
 End-to-end firmware recovery via the `monitor#` shell, for a unit too broken to
 upgrade normally: `enter_monitor_mode` → assign `monitor_ip` → `transfer_file` the
-image → `reboot` into it (normal boot). Aborts if monitor mode isn't reached or the
-flash transfer doesn't confirm.
+image → `reboot` into it. Aborts (before any reboot) if monitor mode isn't reached,
+the flash transfer doesn't confirm, or `image_url` isn't a `tftp:` source.
 
-**Parameters:** `host`, `image_url`, `server`, `monitor_ip` (required), `mask`
-(optional, default `255.255.255.0`), `flash_name` (optional, default `switch.bin`),
-`port` (optional).
+`image_url` **must be a `tftp:` source**: the bootloader `monitor` `copy` only
+understands `tftp:` (an `ftp://` URL is rejected as `Parameter invalid`) and caps the
+source name at 60 chars. This fleet's relay shorthand is
+`tftp:f::<last-chars-of-ftp-dir>/<file>` — e.g.
+`tftp:f::53/BD_3954_interAptiv_2.2.0F_154634.bin` for FTP dir `/BDCOM0053/` — pointed
+at `server` (the TFTP→FTP gateway IP, distinct from the FTP host).
+
+**Parameters:** `host`, `image_url` (a `tftp:` source), `server`, `monitor_ip`
+(required), `mask` (optional, default `255.255.255.0`), `flash_name` (optional,
+default `switch.bin`), `port` (optional).
 
 ### 🧾 Result footer
 
