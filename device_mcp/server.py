@@ -130,17 +130,14 @@ def execute_command(
         bool,
         Field(description="Bypass mode switching and prompt detection, driving the "
               "channel directly. Needed at prompts netmiko doesn't know, e.g. the "
-              "bootloader 'monitor#' shell (where a normal reboot times out and is "
-              "never sent). With raw, 'mode' is ignored; use expect_string/answer for "
-              "a confirmation. Default false."),
+              "bootloader 'monitor#' shell. With raw, 'mode' is ignored. Default false."),
     ] = False,
 ) -> str:
     """Execute a command on a connected network device.
 
     The device must be connected first using ``connect_device``. Returns the raw
     command output followed by a ``[device-mcp]`` footer line reporting any device
-    error and where the CLI ended up (prompt + mode). To reboot from the ``monitor#``
-    shell, pass ``raw=true`` with ``expect_string="\\(y/n\\)"`` and ``answer="y"``.
+    error and where the CLI ended up (prompt + mode).
     """
     try:
         return _manager.execute_command(
@@ -254,7 +251,7 @@ def get_help(
     ],
     command_prefix: Annotated[
         str,
-        Field(description='Text to request help for, e.g. "show " or "" for '
+        Field(description='Text to request help for, e.g. "sh" for possible commands, "show " for possible subcommands or "" for '
               "top-level help"),
     ] = "",
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
@@ -270,82 +267,82 @@ def get_help(
         return f"Error: {exc}"
 
 
-@mcp.tool
-def transfer_file(
-    host: Annotated[
-        str, Field(description="IP address or hostname of the connected device")
-    ],
-    source: Annotated[
-        str,
-        Field(description='Copy source, e.g. "flash:startup-config", '
-              '"tftp:Rajibul/img.bin", or "ftp://user:pass@host/dir/file"'),
-    ],
-    destination: Annotated[
-        str,
-        Field(description='Copy destination, e.g. "flash:switch.bin" or '
-              '"tftp:backup/cfg"'),
-    ],
-    server: Annotated[
-        Optional[str],
-        Field(description="Trailing TFTP/FTP server IP that some BDCOM 'copy' forms "
-              "require, e.g. 170.170.170.170 (optional)"),
-    ] = None,
-    timeout: Annotated[
-        float,
-        Field(description="Max seconds to wait for the transfer (default 120)"),
-    ] = 120.0,
-    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
-) -> str:
-    """Copy a file to/from the device over TFTP/FTP (config backup or image fetch).
+# @mcp.tool
+# def transfer_file(
+#     host: Annotated[
+#         str, Field(description="IP address or hostname of the connected device")
+#     ],
+#     source: Annotated[
+#         str,
+#         Field(description='Copy source, e.g. "flash:startup-config", '
+#               '"tftp:Rajibul/img.bin", or "ftp://user:pass@host/dir/file"'),
+#     ],
+#     destination: Annotated[
+#         str,
+#         Field(description='Copy destination, e.g. "flash:switch.bin" or '
+#               '"tftp:backup/cfg"'),
+#     ],
+#     server: Annotated[
+#         Optional[str],
+#         Field(description="Trailing TFTP/FTP server IP that some BDCOM 'copy' forms "
+#               "require, e.g. 170.170.170.170 (optional)"),
+#     ] = None,
+#     timeout: Annotated[
+#         float,
+#         Field(description="Max seconds to wait for the transfer (default 120)"),
+#     ] = 120.0,
+#     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+# ) -> str:
+#     """Copy a file to/from the device over TFTP/FTP (config backup or image fetch).
 
-    Runs BDCOM ``copy <source> <destination> [server]`` and returns the transfer
-    output plus a ``[device-mcp]`` footer reporting success/failure. Works in normal
-    CLI/enable mode and in the bootloader ``monitor`` shell. Note: a ``copy`` URL may
-    embed plaintext FTP credentials — treat the output as sensitive.
-    """
-    try:
-        return _manager.transfer_file(host, source, destination, server, timeout, port)
-    except Exception as exc:  # noqa: BLE001
-        return f"Error: {exc}"
+#     Runs BDCOM ``copy <source> <destination> [server]`` and returns the transfer
+#     output plus a ``[device-mcp]`` footer reporting success/failure. Works in normal
+#     CLI/enable mode and in the bootloader ``monitor`` shell. Note: a ``copy`` URL may
+#     embed plaintext FTP credentials — treat the output as sensitive.
+#     """
+#     try:
+#         return _manager.transfer_file(host, source, destination, server, timeout, port)
+#     except Exception as exc:  # noqa: BLE001
+#         return f"Error: {exc}"
 
 
-@mcp.tool
-def upgrade_firmware(
-    host: Annotated[
-        str, Field(description="IP address or hostname of the connected device")
-    ],
-    image_url: Annotated[
-        str,
-        Field(description='Firmware image source, e.g. "tftp:Rajibul/switch.bin" or '
-              '"ftp://user:pass@host/dir/img.bin"'),
-    ],
-    server: Annotated[
-        str,
-        Field(description="TFTP/FTP server IP appended to the 'copy' command, e.g. "
-              "170.170.170.170"),
-    ],
-    flash_name: Annotated[
-        str,
-        Field(description='Destination filename in flash (default "switch.bin")'),
-    ] = "switch.bin",
-    reboot: Annotated[
-        bool,
-        Field(description="Reboot into the new image after a successful transfer "
-              "(default true)"),
-    ] = True,
-    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
-) -> str:
-    """Download a firmware image to flash and (optionally) reboot into it.
+# @mcp.tool
+# def upgrade_firmware(
+#     host: Annotated[
+#         str, Field(description="IP address or hostname of the connected device")
+#     ],
+#     image_url: Annotated[
+#         str,
+#         Field(description='Firmware image source, e.g. "tftp:Rajibul/switch.bin" or '
+#               '"ftp://user:pass@host/dir/img.bin"'),
+#     ],
+#     server: Annotated[
+#         str,
+#         Field(description="TFTP/FTP server IP appended to the 'copy' command, e.g. "
+#               "170.170.170.170"),
+#     ],
+#     flash_name: Annotated[
+#         str,
+#         Field(description='Destination filename in flash (default "switch.bin")'),
+#     ] = "switch.bin",
+#     reboot: Annotated[
+#         bool,
+#         Field(description="Reboot into the new image after a successful transfer "
+#               "(default true)"),
+#     ] = True,
+#     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+# ) -> str:
+#     """Download a firmware image to flash and (optionally) reboot into it.
 
-    Normal/enable-mode path: transfers the image to ``flash:<flash_name>``, requires a
-    ``successfully`` confirmation, then reboots answering the ``(y/n)`` prompt. Aborts
-    before rebooting if the transfer did not confirm. For a unit that can't boot far
-    enough to run this, use ``recover_firmware`` (monitor mode) instead.
-    """
-    try:
-        return _manager.upgrade_firmware(host, image_url, server, flash_name, reboot, port)
-    except Exception as exc:  # noqa: BLE001
-        return f"Error: {exc}"
+#     Normal/enable-mode path: transfers the image to ``flash:<flash_name>``, requires a
+#     ``successfully`` confirmation, then reboots answering the ``(y/n)`` prompt. Aborts
+#     before rebooting if the transfer did not confirm. For a unit that can't boot far
+#     enough to run this, use ``recover_firmware`` (monitor mode) instead.
+#     """
+#     try:
+#         return _manager.upgrade_firmware(host, image_url, server, flash_name, reboot, port)
+#     except Exception as exc:  # noqa: BLE001
+#         return f"Error: {exc}"
 
 
 @mcp.tool
@@ -384,16 +381,16 @@ def recover_firmware(
               "at 60 chars. This fleet's relay shorthand is "
               "'tftp:f::<last-chars-of-ftp-dir>/<file>', e.g. "
               "'tftp:f::53/BD_3954_interAptiv_2.2.0F_154634.bin' for FTP dir "
-              "/BDCOM0053/."),
+              "/BDCOM0053/. Using 'f::' will relay the file from the FTP server and serve over TFTP."),
     ],
     server: Annotated[
-        str, Field(description="TFTP/FTP-relay server IP appended to the 'copy' "
-              "command (the gateway that fronts the FTP server)")
+        str, Field(description="TFTP (also FTP-relay) server IP appended to the 'copy' "
+              "command")
     ],
     monitor_ip: Annotated[
         str,
         Field(description="IP to assign the unit in monitor mode so it can reach the "
-              "TFTP/FTP server, e.g. 170.170.170.183"),
+              "TFTP/FTP-relay server, e.g. 170.170.170.183"),
     ],
     mask: Annotated[
         str, Field(description='Subnet mask for monitor_ip (default "255.255.255.0")'),
@@ -403,7 +400,7 @@ def recover_firmware(
     ] = "switch.bin",
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:
-    """End-to-end firmware recovery via the bootloader ``monitor#`` shell.
+    """Firmware recovery/upgrade via the bootloader ``monitor#`` shell.
 
     For a unit too broken to upgrade normally: enters monitor mode, assigns
     ``monitor_ip``, recovers the image to flash, and reboots into it. Aborts if
