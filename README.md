@@ -25,6 +25,8 @@ platform.
 - **✅ Interactive Confirmations**: Answer `(y/n)` / `[confirm]` prompts (e.g. `reboot`, `delete startup-config`) via `expect_string` + `answer`
 - **📜 Console Diagnostics**: Per-connection raw I/O history (`get_console_history`) and live stream reads (`read_console_stream`) for auditing logins, desyncs, and reboots
 - **❓ Inline Help**: Query CLI `?` help with `get_help` (parsed `options:` footer)
+- **💡 Dialect hints**: a rejected/aborted command that's a known Cisco-ism gets a `hint:` with the BDCOM equivalent; a dropped session is reported as `SESSION_TERMINATED`
+- **📦 File transfer & firmware**: `transfer_file` (TFTP/FTP config backup or image fetch), `upgrade_firmware`, and `recover_firmware` / `enter_monitor_mode` for bootloader-shell recovery of a unit that can't boot normally
 - **🤖 AI-Friendly**: Natural language command translation through AI assistants
 - **📊 Connection Monitoring**: Track active connections and their status
 
@@ -210,25 +212,71 @@ input line so the next command runs cleanly. The footer lists the parsed next-to
 **Parameters:** `host` (required), `command_prefix` (optional, e.g. `"show "`),
 `port` (optional).
 
+#### `transfer_file`
+Run a BDCOM `copy <source> <destination> [server]` (config backup or image fetch)
+and report whether the transfer confirmed success. `flash:` paths, `tftp:` and
+`ftp://user:pass@host/dir/file` URLs, and BDCOM's shorthand all pass through. Works
+in normal CLI/enable mode **and** in the bootloader `monitor` shell.
+
+**Parameters:** `host`, `source`, `destination` (required), `server` (optional
+trailing TFTP/FTP IP), `timeout` (optional, default 120), `port` (optional).
+
+#### `upgrade_firmware`
+Download an image to `flash:<flash_name>`, require a `successfully` confirmation,
+then (by default) `reboot` into it answering the `(y/n)` prompt. Aborts before
+rebooting if the transfer doesn't confirm. Normal/enable-mode path — for a unit too
+broken to boot that far, use `recover_firmware`.
+
+**Parameters:** `host`, `image_url`, `server` (required), `flash_name` (optional,
+default `switch.bin`), `reboot` (optional bool, default true), `port` (optional).
+
+#### `enter_monitor_mode`
+Drop the device into the bootloader `monitor#` shell. Two stages: (1) initiate a
+reboot — tries the hidden `menu:` reboot option first (works even at a login
+prompt), falling back to `reboot`+`y`; (2) after `RTC Test`, sends a short **Ctrl-P**
+burst to interrupt the boot into monitor mode (without it the unit boots normally).
+Returns the boot transcript and a `now: monitor#` footer on success.
+
+**Parameters:** `host` (required), `timeout` (optional seconds, default 180),
+`port` (optional).
+
+#### `recover_firmware`
+End-to-end firmware recovery via the `monitor#` shell, for a unit too broken to
+upgrade normally: `enter_monitor_mode` → assign `monitor_ip` → `transfer_file` the
+image → `reboot` into it (normal boot). Aborts if monitor mode isn't reached or the
+flash transfer doesn't confirm.
+
+**Parameters:** `host`, `image_url`, `server`, `monitor_ip` (required), `mask`
+(optional, default `255.255.255.0`), `flash_name` (optional, default `switch.bin`),
+`port` (optional).
+
 ### 🧾 Result footer
 
-`execute_command`, `configure_device`, and `get_help` append one compact status
-line so the model never has to guess session state:
+Every command tool appends one compact status line so the model never has to guess
+session state:
 
 ```
 <raw command output>
 
 [device-mcp] ok | now: Switch# (enable)
-[device-mcp] device error: Unknown command near 'status' | now: Switch# (enable)
-[device-mcp] FAILED: <transport exception> | now: <prompt|unknown>
+[device-mcp] device error: Unknown command near 'status' | hint: BDCOM has no 'show interface status'; use 'show ip interface brief'. | now: Switch# (enable)
+[device-mcp] SESSION_TERMINATED: device returned to login prompt — reconnect required | now: awaiting_login
+[device-mcp] FAILED: <transport exception> | now: <prompt|state>
 [device-mcp] options: interface, ip, ipv6 | now: Switch_config# (config)
 ```
 
 - **device error** — the device *rejected* the command (with the offending token
-  when it prints a `^` caret); distinct from a **FAILED** transport error (e.g. a
-  prompt-detection desync — reconnect).
-- **now** — the current prompt and derived mode (`user`/`enable`/`config`), so the
-  model knows where a sub-mode (e.g. `Switch_config_vlan30#`) left it.
+  when it prints a `^` caret); distinct from a **FAILED** transport error.
+- **SESSION_TERMINATED** — the device dropped the session back to a login prompt
+  (e.g. an idle logout, or `write memory` which BDCOM treats as a forced logout);
+  `disconnect_device` then `connect_device` to recover. Reported instead of a raw
+  `ReadTimeout`, so a desync is immediately obvious.
+- **hint** — for a known Cisco→BDCOM gotcha (see the cheat-sheet below) the footer
+  appends the right command to use; shown on a device error or `SESSION_TERMINATED`.
+- **now** — a closed set of states, never raw read-buffer text: `user` / `enable` /
+  `config` (with the live prompt, e.g. `now: Switch_config_vlan30# (config)`),
+  `monitor` for the bootloader shell, or `awaiting_login` / `session_terminated` /
+  `unknown`.
 
 ### 💡 Usage Examples
 
@@ -313,13 +361,24 @@ driver instead enters enable mode and disables paging there.
 - A config dump exposes plaintext credentials — treat `show running-config` output
   (and `get_console_history`) as sensitive.
 - If a session ever desyncs, `disconnect_device` then `connect_device` for a clean
-  one rather than retrying the failing command.
+  one rather than retrying the failing command. The footer now says
+  `SESSION_TERMINATED` when the device has dropped you to a login prompt.
+- **Firmware:** use `upgrade_firmware` for a healthy unit; for one that can't boot
+  far enough, `recover_firmware` enters the bootloader `monitor#` shell (reboot via
+  the hidden `menu:` option, then a Ctrl-P burst after `RTC Test`) and re-flashes
+  over TFTP/FTP. Use `transfer_file` on its own to back up a config (`flash:` →
+  `tftp:`).
 
 #### BDCOM CLI cheat-sheet (commands the server can't enforce)
 
 The server is a generic executor, so these BDCOM-specific rules are on the caller
-(the footer's `device error` will tell you when one is violated):
+(the footer's `device error` flags a violation, and for the common Cisco-isms below
+it appends the right command as a `hint:`):
 
+- **Save config:** use bare `write` (or `write all`), **not** Cisco `write memory` —
+  on BDCOM the latter is treated as a forced logout (`SESSION_TERMINATED`).
+- **`show` differences:** there is no `show interface status` (use `show ip interface
+  brief`) or `show vlan brief` (use `show vlan`).
 - **Access-port VLAN:** there is no Cisco `switchport access vlan <id>`. Use
   `switchport mode access` then `switchport pvid <id>`.
 - **VRF needs an RD first:** after `ip vrf <name>` / `ipv6 vrf <name>`, set
@@ -338,6 +397,9 @@ The server is a generic executor, so these BDCOM-specific rules are on the calle
 
 - This tool is designed for network automation and management
 - Credentials are passed per connection and not stored
+- A `transfer_file` / firmware `copy` URL may embed plaintext FTP credentials
+  (`ftp://user:pass@host/...`); treat the returned transfer output and
+  `get_console_history` as sensitive
 - Use appropriate network security practices
 - Consider using SSH keys for enhanced security (future enhancement)
 

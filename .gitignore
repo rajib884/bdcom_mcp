@@ -100,3 +100,4 @@ __pycache__/
 
 # Large vendor documentation (kept locally for reference, not committed)
 BDCOM Switch L3 Doc/
+secure_crt_scripts/

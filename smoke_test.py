@@ -15,7 +15,9 @@ from device_mcp.connection import (
     DeviceConnectionManager,
     _ConsoleRingLog,
     _classify_prompt,
+    _classify_session,
     _detect_device_error,
+    _dialect_hint,
     _parse_help_tokens,
     _target,
     resolve_platform,
@@ -31,6 +33,10 @@ EXPECTED_TOOLS = {
     "get_console_history",
     "read_console_stream",
     "get_help",
+    "transfer_file",
+    "upgrade_firmware",
+    "enter_monitor_mode",
+    "recover_firmware",
 }
 
 
@@ -322,6 +328,148 @@ def check_get_help_clears_line() -> None:
     print("get_help line-clear: OK")
 
 
+class _FakeLoginNet:
+    """A netmiko stand-in stuck at a login prompt (a desynced session)."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def check_enable_mode(self) -> bool:
+        return False
+
+    def check_config_mode(self) -> bool:
+        return False
+
+    def find_prompt(self) -> str:
+        return "Username:"
+
+    def send_command(self, command: str, **kw) -> str:
+        self.sent.append(command)
+        raise RuntimeError("Pattern not detected: 'Switch.*'")
+
+    def send_command_timing(self, command: str, **kw) -> str:
+        self.sent.append(command)
+        raise RuntimeError("Pattern not detected")
+
+
+class _FakeTransfer:
+    """A netmiko stand-in that replies to a 'copy' with a scripted transfer log."""
+
+    RETURN = "\n"
+
+    def __init__(self, response: str) -> None:
+        self._response = response
+        self._buf = ""
+        self.sent: list[str] = []
+
+    def write_channel(self, data: str) -> None:
+        self.sent.append(data)
+        if data.strip().startswith("copy"):
+            self._buf += self._response
+
+    def read_channel(self) -> str:
+        data, self._buf = self._buf, ""
+        return data
+
+    def find_prompt(self) -> str:
+        return "Switch#"
+
+
+class _FakeBoot:
+    """A netmiko stand-in that reaches 'monitor#' only after a Ctrl-P burst."""
+
+    RETURN = "\n"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self.ctrlp = 0
+        self.sent: list[str] = []
+
+    def write_channel(self, data: str) -> None:
+        self.sent.append(data)
+        s = data.strip()
+        if s == "menu:":
+            self._buf += ("\nmenu:\n3       dump rawlog info\n4       reboot\n"
+                          "5       debug info\n6       console info\n")
+        elif s == "4":
+            self._buf += ("\nSystem is rebooting, flag=0xf000c\nU-Boot 2011.12\n"
+                          "RTC Test......................PASS!\n")
+        elif data == "\x10":  # Ctrl-P interrupts the boot into the monitor shell
+            self.ctrlp += 1
+            self._buf += "monitor#"
+
+    def read_channel(self) -> str:
+        data, self._buf = self._buf, ""
+        return data
+
+    def find_prompt(self) -> str:
+        return "monitor#"
+
+
+def check_session_state() -> None:
+    assert _classify_session("Username: ") == "awaiting_login"
+    assert _classify_session("Password:") == "awaiting_login"
+    assert _classify_session("Authentication failed!") == "awaiting_login"
+    assert _classify_session("User admin logged out on console 0") == "session_terminated"
+    assert _classify_session("monitor#") == "monitor"
+    assert _classify_session("Switch>") == "user"
+    assert _classify_session("Switch#") == "enable"
+    assert _classify_session("Switch_config#") == "config"
+    assert _classify_session("") == "unknown"
+    assert _classify_session("rd") == "unknown"  # junk help token, not a mode
+    print("session-state classifier: OK")
+
+
+def check_dialect_hint() -> None:
+    assert "write" in (_dialect_hint("write memory") or "")
+    assert "switchport pvid" in (_dialect_hint("switchport access vlan 10") or "")
+    assert "config" in (_dialect_hint("configure terminal") or "")
+    assert _dialect_hint("show vlan brief")
+    assert _dialect_hint("show interface status")
+    assert _dialect_hint("show version") is None
+    print("dialect hints: OK")
+
+
+def check_session_terminated() -> None:
+    mgr = DeviceConnectionManager()
+    _attach(mgr, "h:23", _FakeLoginNet())
+    res = mgr.execute_command("h", "show version", port=23)
+    assert "SESSION_TERMINATED" in res, res
+    assert "now: awaiting_login" in res, res          # no raw "Username:" leak
+    # write memory dropped us to login: the footer should still carry the hint.
+    _attach(mgr, "h:24", _FakeLoginNet())
+    res2 = mgr.execute_command("h", "write memory", port=24)
+    assert "SESSION_TERMINATED" in res2 and "hint:" in res2, res2
+    print("session terminated reporting: OK")
+
+
+def check_transfer_file() -> None:
+    mgr = DeviceConnectionManager()
+    ok_log = ("copy tftp:img.bin flash:switch.bin 1.1.1.1\nTFTP:\n!!!!!\n"
+              "successfully receive 8027243 bytes.\nSwitch#")
+    _attach(mgr, "h:23", _FakeTransfer(ok_log))
+    res = mgr.transfer_file("h", "tftp:img.bin", "flash:switch.bin", "1.1.1.1", port=23)
+    assert "[device-mcp] transfer ok" in res, res
+
+    fail_log = "copy tftp:img.bin flash:switch.bin 1.1.1.1\nTFTP:\ntimeout, aborted\nSwitch#"
+    _attach(mgr, "h:24", _FakeTransfer(fail_log))
+    res2 = mgr.transfer_file("h", "tftp:img.bin", "flash:switch.bin", "1.1.1.1", port=24)
+    assert "FAILED: transfer did not confirm" in res2, res2
+    print("transfer_file: OK")
+
+
+def check_enter_monitor_mode() -> None:
+    mgr = DeviceConnectionManager()
+    net = _FakeBoot()
+    _attach(mgr, "h:23", net)
+    res = mgr.enter_monitor_mode("h", port=23, timeout=30.0)
+    assert "entered monitor mode" in res, res
+    assert "now: monitor# (monitor)" in res, res
+    assert net.ctrlp >= 1, net.ctrlp            # the Ctrl-P burst actually fired
+    assert "4\n" in net.sent, net.sent          # selected the menu's reboot option
+    print("enter_monitor_mode: OK")
+
+
 async def main() -> None:
     tool_list = await mcp.list_tools()
     tools = {t.name: t for t in tool_list}
@@ -361,8 +509,13 @@ async def main() -> None:
     check_console_ring()
     check_target_resolution()
     check_diagnostics()
+    check_session_state()
+    check_dialect_hint()
     check_execute_footer()
+    check_session_terminated()
     check_configure()
+    check_transfer_file()
+    check_enter_monitor_mode()
     check_get_help_clears_line()
     check_get_help_normalize()
 

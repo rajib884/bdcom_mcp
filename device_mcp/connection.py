@@ -37,6 +37,21 @@ Protocol = Literal["ssh", "telnet"]
 # user/enable/config force that exact level.
 Mode = Literal["auto", "user", "enable", "config"]
 
+# Closed set of reportable session states for the footer's ``now:`` field. The
+# first three are normal CLI modes; ``monitor`` is the bootloader recovery shell;
+# the rest are abnormal/transition states. Reporting one of these instead of raw
+# read-buffer text is what makes a desync actionable (see _classify_session).
+SessionState = Literal[
+    "user",
+    "enable",
+    "config",
+    "monitor",
+    "awaiting_login",
+    "session_terminated",
+    "disconnected",
+    "unknown",
+]
+
 # Read timeouts (seconds) for command execution. Generous defaults so large
 # outputs such as ``show running-config`` / ``show tech-support`` complete.
 _EXEC_READ_TIMEOUT = 60.0
@@ -83,9 +98,80 @@ _CONFIG_ERROR_RE = (
 )
 _CARET_LINE_RE = re.compile(r"^(\s*)\^\s*$")
 
+# Patterns that mean the session is no longer at a usable CLI prompt. A trailing
+# login prompt or an auth failure means the device dropped us back to the login
+# (so the next command would be typed as a username); a "logged out" line is the
+# event that caused it. Both are reported as a terminated session needing a
+# reconnect, classified from the console buffer rather than guessed from a raw
+# netmiko timeout (the desyncs seen throughout conn2.log).
+_LOGIN_PROMPT_RE = re.compile(r"(?im)^\s*(?:Username|Login|Password)\s*:\s*$")
+_AUTH_FAILED_RE = re.compile(r"(?i)Authentication failed")
+_LOGGED_OUT_RE = re.compile(r"(?i)logged out|User .*? logged out")
+# The BDCOM bootloader recovery shell prompt (e.g. "monitor#").
+_MONITOR_PROMPT_RE = re.compile(r"(?im)^\s*monitor\s*#")
+
+# Known Cisco-isms that BDCOM rejects (or, worse, mishandles). When a command is
+# rejected or kills the session, the matching hint is surfaced in the footer so the
+# caller doesn't have to know BDCOM's dialect. Each is justified by conn2.log, the
+# README cheat-sheet, or the documented save-config/reboot issues.
+_DIALECT_HINTS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"(?i)\bwrite\s+memory\b"),
+        "BDCOM saves config with bare 'write' (or 'write all'); 'write memory' "
+        "logs the session out.",
+    ),
+    (
+        re.compile(r"(?i)\bswitchport\s+access\s+vlan\b"),
+        "BDCOM has no 'switchport access vlan'; use 'switchport mode access' then "
+        "'switchport pvid <id>'.",
+    ),
+    (
+        re.compile(r"(?i)\bconfigure\s+terminal\b"),
+        "BDCOM enters global config with 'config', not 'configure terminal'.",
+    ),
+    (
+        re.compile(r"(?i)\bshow\s+vlan\s+brief\b"),
+        "BDCOM uses 'show vlan' (no 'brief').",
+    ),
+    (
+        re.compile(r"(?i)\bshow\s+interface\s+status\b"),
+        "BDCOM has no 'show interface status'; use 'show ip interface brief'.",
+    ),
+    (
+        re.compile(r"(?i)^\s*end\s*$"),
+        "BDCOM leaves config with Ctrl-Z or 'exit', not 'end'.",
+    ),
+    (
+        re.compile(r"(?i)^\s*disable\s*$"),
+        "BDCOM leaves privileged mode with 'exit', not 'disable'.",
+    ),
+]
+
+# Markers for the file-transfer and monitor-mode recovery flows (Workstream B).
+# A redrawn CLI/monitor prompt (line ending in '#'/'>') marks "command finished";
+# the device echoes the prompt mid-line on the command itself, so the trailing
+# whitespace anchor only matches the *redrawn* prompt after the output.
+_CLI_PROMPT_RE = re.compile(r"[>#]\s*$")
+_CONFIRM_YN_RE = re.compile(r"\(y/n\)")
+_TRANSFER_OK_RE = re.compile(r"(?i)\bsuccessfully\b")
+_RTC_TEST_RE = re.compile(r"RTC Test")
+# A hidden-menu line offering a reboot, e.g. "4   reboot" or
+# "9   core dump and reboot"; group 1 is the option key to send.
+_MENU_REBOOT_RE = re.compile(r"(?im)^\s*([0-9A-Za-z]{1,2})\s+.*\breboot\b.*$")
+# Ctrl-P drops a booting BDCOM unit into the monitor shell.
+_MONITOR_INTERRUPT = "\x10"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _dialect_hint(command: str) -> Optional[str]:
+    """Return a Cisco->BDCOM hint for ``command`` if it is a known gotcha. Pure."""
+    for pattern, hint in _DIALECT_HINTS:
+        if pattern.search(command):
+            return hint
+    return None
 
 
 def _detect_device_error(output: str) -> Optional[dict[str, Any]]:
@@ -126,13 +212,101 @@ def _classify_prompt(prompt: str) -> str:
     return "unknown"
 
 
-def _describe_prompt(net: Any) -> tuple[Optional[str], str]:
-    """Read the current prompt and classify it; best effort (does channel I/O)."""
+def _classify_session(text: str) -> SessionState:
+    """Classify session state from a prompt string or recent console text. Pure.
+
+    Recognizes the abnormal states (login prompt / auth failure / logout / monitor
+    shell) that a bare prompt classifier would mislabel as ``unknown`` and leak as
+    raw text, then falls back to :func:`_classify_prompt` on the last line for the
+    normal user/enable/config modes.
+    """
+    if not text or not text.strip():
+        return "unknown"
+    if _LOGGED_OUT_RE.search(text):
+        return "session_terminated"
+    if _LOGIN_PROMPT_RE.search(text) or _AUTH_FAILED_RE.search(text):
+        return "awaiting_login"
+    if _MONITOR_PROMPT_RE.search(text):
+        return "monitor"
+    last = text.strip().splitlines()[-1]
+    classified = _classify_prompt(last)
+    return classified  # type: ignore[return-value]  # one of user/enable/config/unknown
+
+
+def _describe_session(
+    net: Any, console: Optional["_ConsoleRingLog"] = None
+) -> tuple[Optional[str], SessionState]:
+    """Return ``(prompt, state)`` for the footer, never leaking raw buffer text.
+
+    Trusts ``find_prompt()`` only when it yields a real CLI/monitor prompt; for an
+    abnormal or unreadable prompt it scans the tail of the console ring (which has
+    already captured a ``Username:``/"logged out" line even when ``find_prompt``
+    times out) so the state is classified rather than guessed.
+    """
     try:
-        prompt = net.find_prompt()
+        prompt: Optional[str] = net.find_prompt()
     except Exception:  # noqa: BLE001
-        return None, "unknown"
-    return prompt, _classify_prompt(prompt)
+        prompt = None
+    if prompt:
+        state = _classify_session(prompt)
+        if state in ("user", "enable", "config", "monitor"):
+            return prompt, state
+        if state != "unknown":
+            # A login/auth/logout prompt: report the state, never the raw text.
+            return None, state
+    if console is not None:
+        scanned = _classify_session(console.text(20))
+        if scanned != "unknown":
+            return None, scanned
+    return None, "unknown"
+
+
+def _read_until(
+    net: Any,
+    pattern: Optional[re.Pattern[str]] = None,
+    *,
+    timeout: float,
+    idle: float = 0.5,
+) -> str:
+    """Accumulate channel output until ``pattern`` matches or ``timeout`` elapses.
+
+    With no ``pattern`` it returns once the channel has been quiet for ``idle``
+    seconds (after at least some data) or the timeout is hit. Always returns whatever
+    was read (partial output on timeout). Does raw channel I/O; the caller holds the
+    manager lock. Read exceptions propagate so the caller can distinguish a dropped
+    session (e.g. a reboot) from a clean quiet period.
+    """
+    acc = ""
+    start = time.time()
+    last_data = start
+    while time.time() - start < timeout:
+        chunk = net.read_channel()
+        if chunk:
+            acc += chunk
+            last_data = time.time()
+            if pattern is not None and pattern.search(acc):
+                break
+        else:
+            if pattern is None and acc and (time.time() - last_data) >= idle:
+                break
+            time.sleep(0.1)
+    return acc
+
+
+def _send_and_read(
+    net: Any,
+    text: str,
+    pattern: Optional[re.Pattern[str]] = None,
+    *,
+    timeout: float,
+    idle: float = 0.5,
+    newline: bool = True,
+) -> str:
+    """Write ``text`` (with the channel's RETURN unless ``newline`` is False) and
+    read the response via :func:`_read_until`."""
+    data = text + (getattr(net, "RETURN", "\n") if newline else "")
+    net.write_channel(data)
+    return _read_until(net, pattern, timeout=timeout, idle=idle)
 
 
 def _parse_help_tokens(output: str) -> list[str]:
@@ -149,14 +323,29 @@ def _footer(
     *,
     device_error: Optional[dict[str, Any]] = None,
     failure: Optional[str] = None,
+    terminated: bool = False,
     prompt: Optional[str] = None,
-    mode: str = "unknown",
+    state: str = "unknown",
     options: Optional[list[str]] = None,
     note: Optional[str] = None,
+    hint: Optional[str] = None,
 ) -> str:
-    """Build the single-line ``[device-mcp]`` status footer appended to output."""
-    where = f"now: {prompt} ({mode})" if prompt else f"now: unknown ({mode})"
-    if failure:
+    """Build the single-line ``[device-mcp]`` status footer appended to output.
+
+    The ``now:`` field shows the live prompt only for a recognized CLI/monitor mode;
+    any abnormal state is reported by name (e.g. ``now: awaiting_login``) so leftover
+    read-buffer text can never leak in as a bogus "mode". An optional ``hint``
+    (a Cisco->BDCOM gotcha) is appended after the head.
+    """
+    if prompt and state in ("user", "enable", "config", "monitor"):
+        where = f"now: {prompt} ({state})"
+    else:
+        where = f"now: {state}"
+    if terminated:
+        head = (
+            "SESSION_TERMINATED: device returned to login prompt — reconnect required"
+        )
+    elif failure:
         head = f"FAILED: {failure}"
     elif device_error:
         near = device_error.get("near")
@@ -169,6 +358,8 @@ def _footer(
         head = "options: " + (", ".join(options) if options else "(none)")
     else:
         head = "ok"
+    if hint:
+        head += f" | hint: {hint}"
     return f"[device-mcp] {head} | {where}"
 
 
@@ -395,7 +586,11 @@ class DeviceConnectionManager:
                     )
                 elif expect_string and answer is not None:
                     # Interactive confirmation (e.g. BDCOM "(y/n)"): send the
-                    # command, wait for the prompt, then answer it.
+                    # command, wait for the prompt, then answer it. Capture the
+                    # answer's full aftermath (e.g. the "System is rebooting" banner)
+                    # via a raw drain instead of a second send_command, which would
+                    # wait for a clean prompt that a reboot never returns - leaving a
+                    # misleadingly empty result.
                     output = net.send_command(
                         command,
                         expect_string=expect_string,
@@ -403,9 +598,8 @@ class DeviceConnectionManager:
                         auto_find_prompt=False,
                     )
                     try:
-                        output += "\n" + net.send_command(
-                            answer, read_timeout=_EXEC_READ_TIMEOUT
-                        )
+                        net.write_channel(answer + getattr(net, "RETURN", "\n"))
+                        output += "\n" + _read_until(net, timeout=8.0, idle=1.5)
                     except Exception as confirm_exc:  # noqa: BLE001
                         if "reboot" in command.lower() or "reload" in command.lower():
                             output += f"\n[Connection closed during reboot: {confirm_exc}]"
@@ -414,15 +608,26 @@ class DeviceConnectionManager:
                 else:
                     output = net.send_command(command, read_timeout=_EXEC_READ_TIMEOUT)
             except Exception as exc:  # noqa: BLE001 - report what broke + where we are
-                prompt, where = _describe_prompt(net)
+                prompt, state = _describe_session(net, conn.console)
+                if state in ("awaiting_login", "session_terminated"):
+                    return _footer(terminated=True, prompt=prompt, state=state,
+                                   hint=_dialect_hint(command))
                 return _footer(failure=f"{type(exc).__name__}: {exc}",
-                               prompt=prompt, mode=where)
+                               prompt=prompt, state=state, hint=_dialect_hint(command))
 
-            prompt, where = _describe_prompt(net)
-            conn.current_mode = where if where in ("user", "enable", "config") else conn.current_mode
+            prompt, state = _describe_session(net, conn.console)
+            conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
+            if state in ("awaiting_login", "session_terminated"):
+                # A command that succeeded on the wire but dropped us to login
+                # (e.g. 'write memory' on BDCOM) is a terminated session, not "ok".
+                return output.rstrip("\n") + "\n\n" + _footer(
+                    terminated=True, prompt=prompt, state=state,
+                    hint=_dialect_hint(command),
+                )
             device_error = _detect_device_error(output)
             return output.rstrip("\n") + "\n\n" + _footer(
-                device_error=device_error, prompt=prompt, mode=where
+                device_error=device_error, prompt=prompt, state=state,
+                hint=_dialect_hint(command) if device_error else None,
             )
 
     # ------------------------------------------------------------------ configure
@@ -456,19 +661,30 @@ class DeviceConnectionManager:
                 )
             except ConfigInvalidException as exc:
                 # send_config_set may strand the session in a submode on error.
-                prompt, where = _describe_prompt(net)
-                conn.current_mode = where if where in ("user", "enable", "config") else conn.current_mode
-                return _footer(failure=str(exc), prompt=prompt, mode=where)
+                prompt, state = _describe_session(net, conn.console)
+                conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
+                hint = next((_dialect_hint(c) for c in commands if _dialect_hint(c)), None)
+                if state in ("awaiting_login", "session_terminated"):
+                    return _footer(terminated=True, prompt=prompt, state=state, hint=hint)
+                return _footer(failure=str(exc), prompt=prompt, state=state, hint=hint)
             except Exception as exc:  # noqa: BLE001
-                prompt, where = _describe_prompt(net)
+                prompt, state = _describe_session(net, conn.console)
+                hint = next((_dialect_hint(c) for c in commands if _dialect_hint(c)), None)
+                if state in ("awaiting_login", "session_terminated"):
+                    return _footer(terminated=True, prompt=prompt, state=state, hint=hint)
                 return _footer(failure=f"{type(exc).__name__}: {exc}",
-                               prompt=prompt, mode=where)
+                               prompt=prompt, state=state, hint=hint)
 
             conn.current_mode = "enable"  # send_config_set exits config mode
-            prompt, where = _describe_prompt(net)
-            conn.current_mode = where if where in ("user", "enable", "config") else conn.current_mode
+            prompt, state = _describe_session(net, conn.console)
+            conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
+            if state in ("awaiting_login", "session_terminated"):
+                return output.rstrip("\n") + "\n\n" + _footer(
+                    terminated=True, prompt=prompt, state=state,
+                    hint=next((_dialect_hint(c) for c in commands if _dialect_hint(c)), None),
+                )
             return output.rstrip("\n") + "\n\n" + _footer(
-                note=f"applied {len(commands)} command(s)", prompt=prompt, mode=where
+                note=f"applied {len(commands)} command(s)", prompt=prompt, state=state
             )
 
     # ------------------------------------------------------------- diagnostics
@@ -544,32 +760,42 @@ class DeviceConnectionManager:
             net = conn.connection
             conn.last_activity = _now()
 
+            # Capture the base prompt first: after listing help, the device redraws
+            # exactly this prompt (ending '#' in enable/config, '>' in user mode)
+            # followed by our prefix, which is our "help complete" marker.
+            try:
+                base_prompt = net.find_prompt()
+            except Exception:  # noqa: BLE001
+                base_prompt = None
+
+            # Drain any stale buffer (e.g. a previous command's tail) so it can't
+            # contaminate the help text or the redrawn-prompt detection.
+            try:
+                net.read_channel()
+            except Exception:  # noqa: BLE001
+                pass
+
             net.write_channel(prefix + "?")
-            out = ""
-            # Long help lists (e.g. "ip ?") can take a while; cap generously and
-            # rely on a quiet period to detect the end.
-            deadline = time.time() + 8.0
-            empties = 0
-            while time.time() < deadline and empties < 3:
-                time.sleep(0.3)
-                chunk = net.read_channel()
-                if chunk:
-                    out += chunk
-                    empties = 0
-                else:
-                    empties += 1
+            # Read until the base prompt is redrawn after the help body. Match the
+            # actual prompt string so a '#'/'>' inside a help description can't stop
+            # us early; fall back to a quiet period when the prompt is unknown.
+            # Long lists (e.g. "ip ?") can take a while, so the timeout is generous.
+            marker = (
+                re.compile(re.escape(base_prompt.strip())) if base_prompt else None
+            )
+            out = _read_until(net, marker, timeout=15.0, idle=2.0)
 
             # Erase the prefix the device redrew on the line so it is not prepended
             # to whatever command runs next. Bound the loop to the prefix length
             # (plus margin) so a device that never bells can't spin.
             self._clear_input_line(net, len(prefix) + 8)
-            prompt, where = _describe_prompt(net)
+            prompt, state = _describe_session(net, conn.console)
 
         device_error = _detect_device_error(out)
         if device_error:
-            footer = _footer(device_error=device_error, prompt=prompt, mode=where)
+            footer = _footer(device_error=device_error, prompt=prompt, state=state)
         else:
-            footer = _footer(options=_parse_help_tokens(out), prompt=prompt, mode=where)
+            footer = _footer(options=_parse_help_tokens(out), prompt=prompt, state=state)
         return out.rstrip("\n") + "\n\n" + footer
 
     @staticmethod
@@ -591,6 +817,211 @@ class DeviceConnectionManager:
                     break
         except Exception:  # noqa: BLE001 - cleanup is best effort
             pass
+
+    # ----------------------------------------------- file transfer / firmware
+    def transfer_file(
+        self,
+        host: str,
+        source: str,
+        destination: str,
+        server: str | None = None,
+        timeout: float = 120.0,
+        port: int | None = None,
+    ) -> str:
+        """Run a BDCOM ``copy`` and report whether the transfer succeeded.
+
+        Builds ``copy <source> <destination> [server]`` and waits for the prompt to
+        return (transfer done) or the timeout. ``flash:`` paths, ``tftp:`` /
+        ``ftp://user:pass@host/dir/file`` URLs, and BDCOM's shorthand all pass
+        through unchanged. Works in CLI/enable mode and in the bootloader ``monitor``
+        shell (plain ``copy``). Mirrors the ``download_configs.py`` / ``tftp_script.py``
+        copy step.
+        """
+        cmd = f"copy {source} {destination}"
+        if server:
+            cmd += f" {server}"
+        with self._lock:
+            conn = self._connections[self._resolve(host, port)]
+            if not conn.connected:
+                raise RuntimeError(
+                    f"No active connection to {host}. Please connect first."
+                )
+            net = conn.connection
+            conn.last_activity = _now()
+            try:
+                try:
+                    net.read_channel()  # drain residue before issuing the copy
+                except Exception:  # noqa: BLE001
+                    pass
+                out = _send_and_read(net, cmd, _CLI_PROMPT_RE, timeout=timeout, idle=3.0)
+            except Exception as exc:  # noqa: BLE001
+                prompt, state = _describe_session(net, conn.console)
+                return _footer(failure=f"{type(exc).__name__}: {exc}",
+                               prompt=prompt, state=state)
+            prompt, state = _describe_session(net, conn.console)
+
+        device_error = _detect_device_error(out)
+        if device_error:
+            footer = _footer(device_error=device_error, prompt=prompt, state=state)
+        elif _TRANSFER_OK_RE.search(out):
+            footer = _footer(note="transfer ok", prompt=prompt, state=state)
+        else:
+            footer = _footer(failure="transfer did not confirm success",
+                             prompt=prompt, state=state)
+        return out.rstrip("\n") + "\n\n" + footer
+
+    def upgrade_firmware(
+        self,
+        host: str,
+        image_url: str,
+        server: str,
+        flash_name: str = "switch.bin",
+        reboot: bool = True,
+        port: int | None = None,
+    ) -> str:
+        """Download a firmware image to flash and (optionally) reboot into it.
+
+        Normal/enable-mode path (from ``tftp_script.py``): ``transfer_file`` the image
+        to ``flash:<flash_name>``, require a ``successfully`` confirmation, then
+        ``reboot`` answering the ``(y/n)`` prompt. Aborts before rebooting if the
+        transfer did not confirm success.
+        """
+        transfer = self.transfer_file(
+            host, image_url, f"flash:{flash_name}", server, timeout=300.0, port=port
+        )
+        if not _TRANSFER_OK_RE.search(transfer):
+            return transfer  # footer already explains the failure; don't reboot
+        if not reboot:
+            return transfer
+        reboot_out = self.execute_command(
+            host, "reboot", expect_string=r"\(y/n\)", answer="y", port=port
+        )
+        return transfer.rstrip("\n") + "\n\n--- reboot ---\n" + reboot_out
+
+    def enter_monitor_mode(
+        self, host: str, port: int | None = None, timeout: float = 180.0
+    ) -> str:
+        """Drop the device into the bootloader ``monitor#`` shell (two stages).
+
+        (1) Initiate a reboot: always try the hidden menu first - send ``menu:`` and
+        select the option whose description contains ``reboot`` (works even at a login
+        prompt, no credentials needed); if no such menu appears, fall back to the
+        ``reboot`` command + ``y``. (2) Interrupt the boot: once ``RTC Test`` is seen,
+        send a short bounded burst of Ctrl-P (the actual monitor-entry step - without
+        it the unit boots normally), then read for ``monitor#``. Distilled from
+        ``monitor&*.py`` + ``boot_interrupt.py`` + ``wait.py``. Control bytes and
+        patterns are module constants (verify against hardware).
+        """
+        with self._lock:
+            conn = self._connections[self._resolve(host, port)]
+            if not conn.connected:
+                raise RuntimeError(
+                    f"No active connection to {host}. Please connect first."
+                )
+            net = conn.connection
+            conn.last_activity = _now()
+            out = ""
+            try:
+                try:
+                    net.read_channel()  # drain residue
+                except Exception:  # noqa: BLE001
+                    pass
+                # Stage 1: initiate the reboot (menu first, reboot+y fallback).
+                menu = _send_and_read(net, "menu:", _MENU_REBOOT_RE, timeout=10.0, idle=1.0)
+                out += menu
+                option = _MENU_REBOOT_RE.search(menu)
+                if option:
+                    out += _send_and_read(
+                        net, option.group(1), _RTC_TEST_RE, timeout=90.0, idle=2.0
+                    )
+                else:
+                    out += _send_and_read(
+                        net, "reboot", _CONFIRM_YN_RE, timeout=15.0, idle=2.0
+                    )
+                    out += _send_and_read(
+                        net, "y", _RTC_TEST_RE, timeout=90.0, idle=2.0
+                    )
+
+                # Stage 2: interrupt the boot with a short Ctrl-P burst after RTC Test.
+                if _RTC_TEST_RE.search(out):
+                    for _ in range(5):
+                        net.write_channel(_MONITOR_INTERRUPT)
+                        time.sleep(0.5)
+                out += _read_until(
+                    net, _MONITOR_PROMPT_RE, timeout=max(10.0, timeout - 90.0), idle=2.0
+                )
+            except Exception as exc:  # noqa: BLE001
+                prompt, state = _describe_session(net, conn.console)
+                return out.rstrip("\n") + "\n\n" + _footer(
+                    failure=f"{type(exc).__name__}: {exc}", prompt=prompt, state=state
+                )
+            prompt, state = _describe_session(net, conn.console)
+
+        if state == "monitor" or _MONITOR_PROMPT_RE.search(out):
+            return out.rstrip("\n") + "\n\n" + _footer(
+                note="entered monitor mode", prompt="monitor#", state="monitor"
+            )
+        return out.rstrip("\n") + "\n\n" + _footer(
+            failure="did not reach monitor mode (no 'monitor#' seen)",
+            prompt=prompt, state=state,
+        )
+
+    def recover_firmware(
+        self,
+        host: str,
+        image_url: str,
+        server: str,
+        monitor_ip: str,
+        mask: str = "255.255.255.0",
+        flash_name: str = "switch.bin",
+        port: int | None = None,
+    ) -> str:
+        """End-to-end monitor-mode recovery (the shape of the four ``monitor&*.py``).
+
+        ``enter_monitor_mode`` -> assign ``ip addr`` in the monitor shell -> recover
+        the image with ``transfer_file`` -> ``reboot`` into it (normal boot, **no**
+        Ctrl-P this time). Aborts if monitor mode isn't reached or the flash transfer
+        doesn't confirm.
+        """
+        out = self.enter_monitor_mode(host, port=port)
+        if "entered monitor mode" not in out:
+            return out  # footer explains why monitor mode wasn't reached
+
+        with self._lock:
+            conn = self._connections[self._resolve(host, port)]
+            net = conn.connection
+            conn.last_activity = _now()
+            out += "\n--- assign ip ---\n" + _send_and_read(
+                net, f"ip addr {monitor_ip} {mask}", _CLI_PROMPT_RE,
+                timeout=15.0, idle=2.0,
+            )
+
+        transfer = self.transfer_file(
+            host, image_url, f"flash:{flash_name}", server, timeout=300.0, port=port
+        )
+        out += "\n--- transfer ---\n" + transfer
+        if not _TRANSFER_OK_RE.search(transfer):
+            return out.rstrip("\n") + "\n\n" + _footer(
+                failure="flash transfer did not confirm; not rebooting",
+                prompt="monitor#", state="monitor",
+            )
+
+        with self._lock:
+            conn = self._connections[self._resolve(host, port)]
+            net = conn.connection
+            conn.last_activity = _now()
+            out += "\n--- reboot ---\n" + _send_and_read(
+                net, "reboot", _CONFIRM_YN_RE, timeout=15.0, idle=2.0
+            )
+            try:
+                out += _send_and_read(net, "y", None, timeout=8.0, idle=2.0)
+            except Exception as exc:  # noqa: BLE001
+                out += f"\n[Connection activity during reboot: {exc}]"
+
+        return out.rstrip("\n") + "\n\n" + _footer(
+            note="recovery complete: rebooting into new image",
+            prompt="monitor#", state="monitor",
+        )
 
     # ------------------------------------------------------------- mode switching
     def _switch_mode(self, conn: DeviceConnection, target: Mode) -> None:
