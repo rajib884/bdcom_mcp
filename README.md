@@ -232,9 +232,10 @@ default `switch.bin`), `reboot` (optional bool, default true), `port` (optional)
 
 #### `enter_monitor_mode`
 Drop the device into the bootloader `monitor#` shell. Two stages: (1) initiate a
-reboot — tries the hidden `menu:` reboot option first (works even at a login
-prompt), falling back to `reboot`+`y`; (2) after `RTC Test`, sends a short **Ctrl-P**
-burst to interrupt the boot into monitor mode (without it the unit boots normally).
+reboot — tries the hidden boot menu first (**Ctrl-]**, then the single-keystroke
+reboot option; works even at a login prompt), falling back to `reboot`+`y`; (2)
+after `RTC Test`, sends a short **Ctrl-P** burst to interrupt the boot into monitor
+mode (without it the unit boots normally).
 Returns the boot transcript and a `now: monitor#` footer on success.
 
 **Parameters:** `host` (required), `timeout` (optional seconds, default 180),
@@ -365,9 +366,9 @@ driver instead enters enable mode and disables paging there.
   `SESSION_TERMINATED` when the device has dropped you to a login prompt.
 - **Firmware:** use `upgrade_firmware` for a healthy unit; for one that can't boot
   far enough, `recover_firmware` enters the bootloader `monitor#` shell (reboot via
-  the hidden `menu:` option, then a Ctrl-P burst after `RTC Test`) and re-flashes
-  over TFTP/FTP. Use `transfer_file` on its own to back up a config (`flash:` →
-  `tftp:`).
+  the hidden boot menu — Ctrl-] then the reboot option — then a Ctrl-P burst after
+  `RTC Test`) and re-flashes over TFTP/FTP. Use `transfer_file` on its own to back up
+  a config (`flash:` → `tftp:`).
 
 #### BDCOM CLI cheat-sheet (commands the server can't enforce)
 

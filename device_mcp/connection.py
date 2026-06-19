@@ -156,9 +156,12 @@ _CONFIRM_YN_RE = re.compile(r"\(y/n\)")
 _TRANSFER_OK_RE = re.compile(r"(?i)\bsuccessfully\b")
 _RTC_TEST_RE = re.compile(r"RTC Test")
 # A hidden-menu line offering a reboot, e.g. "4   reboot" or
-# "9   core dump and reboot"; group 1 is the option key to send.
+# "9   core dump and reboot"; group 1 is the single-keystroke option to send.
 _MENU_REBOOT_RE = re.compile(r"(?im)^\s*([0-9A-Za-z]{1,2})\s+.*\breboot\b.*$")
-# Ctrl-P drops a booting BDCOM unit into the monitor shell.
+# Ctrl-] opens the hidden boot/console menu: the device prints "menu:" then a list
+# of single-keystroke options (so the option key is sent with no newline). Ctrl-P
+# drops a booting BDCOM unit into the monitor shell.
+_MENU_TRIGGER = "\x1d"
 _MONITOR_INTERRUPT = "\x10"
 
 
@@ -903,10 +906,11 @@ class DeviceConnectionManager:
     ) -> str:
         """Drop the device into the bootloader ``monitor#`` shell (two stages).
 
-        (1) Initiate a reboot: always try the hidden menu first - send ``menu:`` and
-        select the option whose description contains ``reboot`` (works even at a login
-        prompt, no credentials needed); if no such menu appears, fall back to the
-        ``reboot`` command + ``y``. (2) Interrupt the boot: once ``RTC Test`` is seen,
+        (1) Initiate a reboot: always try the hidden menu first - send Ctrl-] (the
+        device prints ``menu:`` then single-keystroke options) and press the option
+        whose description contains ``reboot`` (works even at a login prompt, no
+        credentials needed); if no such menu appears, fall back to the ``reboot``
+        command + ``y``. (2) Interrupt the boot: once ``RTC Test`` is seen,
         send a short bounded burst of Ctrl-P (the actual monitor-entry step - without
         it the unit boots normally), then read for ``monitor#``. Distilled from
         ``monitor&*.py`` + ``boot_interrupt.py`` + ``wait.py``. Control bytes and
@@ -926,13 +930,18 @@ class DeviceConnectionManager:
                     net.read_channel()  # drain residue
                 except Exception:  # noqa: BLE001
                     pass
-                # Stage 1: initiate the reboot (menu first, reboot+y fallback).
-                menu = _send_and_read(net, "menu:", _MENU_REBOOT_RE, timeout=10.0, idle=1.0)
+                # Stage 1: initiate the reboot (hidden menu first, reboot+y fallback).
+                # Ctrl-] opens the menu; the option is a single keystroke (no newline).
+                menu = _send_and_read(
+                    net, _MENU_TRIGGER, _MENU_REBOOT_RE, timeout=10.0, idle=1.0,
+                    newline=False,
+                )
                 out += menu
                 option = _MENU_REBOOT_RE.search(menu)
                 if option:
                     out += _send_and_read(
-                        net, option.group(1), _RTC_TEST_RE, timeout=90.0, idle=2.0
+                        net, option.group(1), _RTC_TEST_RE, timeout=90.0, idle=2.0,
+                        newline=False,
                     )
                 else:
                     out += _send_and_read(

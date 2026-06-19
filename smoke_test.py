@@ -387,11 +387,10 @@ class _FakeBoot:
 
     def write_channel(self, data: str) -> None:
         self.sent.append(data)
-        s = data.strip()
-        if s == "menu:":
+        if data == "\x1d":  # Ctrl-]: open the hidden menu (printed as "menu:")
             self._buf += ("\nmenu:\n3       dump rawlog info\n4       reboot\n"
                           "5       debug info\n6       console info\n")
-        elif s == "4":
+        elif data == "4":  # the reboot option, a single keystroke (no newline)
             self._buf += ("\nSystem is rebooting, flag=0xf000c\nU-Boot 2011.12\n"
                           "RTC Test......................PASS!\n")
         elif data == "\x10":  # Ctrl-P interrupts the boot into the monitor shell
@@ -466,7 +465,8 @@ def check_enter_monitor_mode() -> None:
     assert "entered monitor mode" in res, res
     assert "now: monitor# (monitor)" in res, res
     assert net.ctrlp >= 1, net.ctrlp            # the Ctrl-P burst actually fired
-    assert "4\n" in net.sent, net.sent          # selected the menu's reboot option
+    assert "\x1d" in net.sent, net.sent         # opened the menu with Ctrl-]
+    assert "4" in net.sent, net.sent            # pressed the reboot option (no newline)
     print("enter_monitor_mode: OK")
 
 
