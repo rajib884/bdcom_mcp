@@ -113,9 +113,12 @@ Establish a connection to a network device.
 
 **Audit log:** every connection's full device I/O (from the login banner through
 disconnect) is written to `./logs/<host>_<port>_<UTC-timestamp>.log` — the directory
-is overridable with the `DEVICE_MCP_LOG_DIR` env var. The path is returned as
-`log_file` in the connect result (and in `list_connections`). A failed connection
-still leaves its partial transcript on disk (handy for diagnosing a bad login).
+is overridable with the `DEVICE_MCP_LOG_DIR` env var. The server also polls idle
+connections, so unsolicited console output (reboot progress, link events, login
+prompts) is captured even when no tool call is actively executing. The path is
+returned as `log_file` in the connect result (and in `list_connections`). A failed
+connection still leaves its partial transcript on disk (handy for diagnosing a bad
+login).
 > ⚠️ These logs capture raw I/O and can contain plaintext credentials — treat the
 > `logs/` directory as sensitive (it is git-ignored).
 

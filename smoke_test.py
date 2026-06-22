@@ -6,6 +6,7 @@ host:port resolution and error paths.
 """
 
 import asyncio
+import time
 
 from netmiko.exceptions import ConfigInvalidException
 
@@ -426,6 +427,48 @@ class _FakeMonitor:
     send_command_timing = _stale_prompt
 
 
+class _FakeIdleNet:
+    """Netmiko-like idle output source: read_channel logs what it drains."""
+
+    def __init__(self, chunks: list[str], session_log: _ConsoleRingLog) -> None:
+        self._chunks = list(chunks)
+        self.session_log = session_log
+
+    def read_channel(self) -> str:
+        chunk = self._chunks.pop(0) if self._chunks else ""
+        if chunk:
+            self.session_log.write(chunk)
+        return chunk
+
+    def disconnect(self) -> None:
+        pass
+
+
+class _FakeIdleCommandNet(_FakeNet):
+    """Fake command channel with idle output drained through session_log."""
+
+    def __init__(
+        self,
+        chunks: list[str],
+        session_log: _ConsoleRingLog,
+        *,
+        output: str = "command ok",
+        prompt: str = "Switch#",
+    ) -> None:
+        super().__init__(output=output, prompt=prompt)
+        self._chunks = list(chunks)
+        self.session_log = session_log
+
+    def read_channel(self) -> str:
+        chunk = self._chunks.pop(0) if self._chunks else ""
+        if chunk:
+            self.session_log.write(chunk)
+        return chunk
+
+    def disconnect(self) -> None:
+        pass
+
+
 class _FakeBoot:
     """A netmiko stand-in that reaches 'monitor#' only after a Ctrl-P burst."""
 
@@ -583,6 +626,71 @@ def check_console_ring_tee(tmp_path: str = "logs/_smoke_tee_test.log") -> None:
     print("_ConsoleRingLog file tee: OK")
 
 
+def check_idle_console_file_logging(
+    tmp_path: str = "logs/_smoke_idle_log_test.log",
+) -> None:
+    """Unsolicited idle output is drained into the ring/file without a command."""
+    import os
+
+    os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+    fh = open(tmp_path, "w", encoding="utf-8")
+    ring = _ConsoleRingLog(file=fh)
+    net = _FakeIdleNet(["\nLINK-3-UPDOWN: port changed state\n"], ring)
+    mgr = DeviceConnectionManager()
+    conn = DeviceConnection(
+        config={"host": "h", "port": 23, "device_type": "bdcom", "protocol": "telnet"},
+        connection=net,
+        console=ring,
+        log_path=tmp_path,
+    )
+    mgr._connections["h:23"] = conn
+    mgr._start_idle_logger("h:23", conn)
+    deadline = time.time() + 2.0
+    while "LINK-3-UPDOWN" not in ring.text(None) and time.time() < deadline:
+        time.sleep(0.05)
+    assert "LINK-3-UPDOWN" in ring.text(None), ring.text(None)
+    conn.idle_log_stop.set()
+    ring.close()
+    with open(tmp_path, encoding="utf-8") as f:
+        contents = f.read()
+    assert "LINK-3-UPDOWN" in contents, contents
+    os.remove(tmp_path)
+    print("idle console file logging: OK")
+
+
+def check_idle_logger_preserves_tools() -> None:
+    """Idle capture must not break execute_command or get_console_history."""
+    ring = _ConsoleRingLog()
+    net = _FakeIdleCommandNet(
+        ["\nLINK-3-UPDOWN: port changed state\n"],
+        ring,
+        output="BDCOM Software Version 2.2.0F",
+    )
+    mgr = DeviceConnectionManager()
+    conn = DeviceConnection(
+        config={"host": "h", "port": 23, "device_type": "bdcom", "protocol": "telnet"},
+        connection=net,
+        console=ring,
+    )
+    mgr._connections["h:23"] = conn
+    mgr._start_idle_logger("h:23", conn)
+    deadline = time.time() + 2.0
+    while "LINK-3-UPDOWN" not in mgr.get_console_history("h", port=23) and time.time() < deadline:
+        time.sleep(0.05)
+
+    history = mgr.get_console_history("h", port=23)
+    assert "LINK-3-UPDOWN" in history, history
+
+    result = mgr.execute_command("h", "show version", port=23)
+    assert "BDCOM Software Version" in result, result
+    assert net.sent == ["show version"], net.sent
+    assert "LINK-3-UPDOWN" in mgr.get_console_history("h", port=23)
+
+    conn.idle_log_stop.set()
+    ring.close()
+    print("idle logger preserves tools: OK")
+
+
 def check_recover_firmware_guard() -> None:
     """recover_firmware rejects a non-tftp source before any reboot cycle."""
     mgr = DeviceConnectionManager()
@@ -641,6 +749,8 @@ async def main() -> None:
     check_target()
     check_console_ring()
     check_console_ring_tee()
+    check_idle_console_file_logging()
+    check_idle_logger_preserves_tools()
     check_target_resolution()
     check_diagnostics()
     check_session_state()

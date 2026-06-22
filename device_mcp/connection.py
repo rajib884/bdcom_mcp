@@ -62,6 +62,10 @@ _CONFIG_READ_TIMEOUT = 60.0
 
 # Hard ceiling for read_console_stream so a tool call cannot block forever.
 _MAX_STREAM_TIMEOUT = 120.0
+# How often an otherwise-idle connection is polled for unsolicited console output.
+# The poller takes the manager lock non-blockingly, so active tool calls keep
+# exclusive channel ownership.
+_IDLE_LOG_POLL_INTERVAL = 0.25
 
 # Default transport ports, used to resolve a target when no port is supplied.
 _DEFAULT_PORTS: dict[str, int] = {"ssh": 22, "telnet": 23}
@@ -575,6 +579,8 @@ class DeviceConnection:
     last_activity: datetime = field(default_factory=_now)
     current_mode: Mode = "user"
     log_path: Optional[str] = None
+    idle_log_stop: threading.Event | None = None
+    idle_log_thread: threading.Thread | None = None
 
 
 class DeviceConnectionManager:
@@ -678,7 +684,7 @@ class DeviceConnectionManager:
             if auto_bypass_wizard:
                 self._maybe_bypass_wizard(connection)
 
-            self._connections[target] = DeviceConnection(
+            managed = DeviceConnection(
                 config={
                     "host": host,
                     "port": resolved_port,
@@ -691,6 +697,8 @@ class DeviceConnectionManager:
                 connected_at=opened,
                 log_path=log_path,
             )
+            self._connections[target] = managed
+            self._start_idle_logger(target, managed)
             return {
                 "success": True,
                 "message": (
@@ -702,6 +710,51 @@ class DeviceConnectionManager:
                 "target": target,
                 "log_file": log_path,
             }
+
+    def _start_idle_logger(self, target: str, conn: DeviceConnection) -> None:
+        """Poll a quiet connection so unsolicited console output reaches the log.
+
+        Netmiko writes to ``session_log`` only when someone reads/writes the channel.
+        Without this poller, device output emitted while the MCP server is idle stays
+        in the transport buffer and never reaches the durable audit file.
+        """
+        stop = threading.Event()
+        conn.idle_log_stop = stop
+        thread = threading.Thread(
+            target=self._idle_log_loop,
+            args=(target, stop),
+            name=f"device-mcp-idle-log-{target}",
+            daemon=True,
+        )
+        conn.idle_log_thread = thread
+        thread.start()
+
+    def _idle_log_loop(self, target: str, stop: threading.Event) -> None:
+        """Best-effort idle drain for unsolicited device output."""
+        while not stop.wait(_IDLE_LOG_POLL_INTERVAL):
+            acquired = self._lock.acquire(blocking=False)
+            if not acquired:
+                continue
+            try:
+                conn = self._connections.get(target)
+                if conn is None or not conn.connected:
+                    return
+                try:
+                    chunk = conn.connection.read_channel()
+                except Exception as exc:  # noqa: BLE001 - idle logging is best effort
+                    if conn.console is not None:
+                        conn.console.write(
+                            f"\n[device-mcp] idle log stopped: "
+                            f"{type(exc).__name__}: {exc}\n"
+                        )
+                    return
+                if chunk:
+                    # Netmiko's read_channel() has already written this data to the
+                    # session_log, which is our _ConsoleRingLog. Do not write it here
+                    # too, or the audit file will contain duplicates.
+                    conn.last_activity = _now()
+            finally:
+                self._lock.release()
 
     # ------------------------------------------------------------------ execute
     def run_commands(
@@ -1363,6 +1416,8 @@ class DeviceConnectionManager:
             except Exception as exc:  # noqa: BLE001
                 return self._failure(host, f"Error disconnecting from {key}: {exc}", port=port)
             finally:
+                if conn.idle_log_stop is not None:
+                    conn.idle_log_stop.set()
                 # Close the audit log after netmiko's final writes are captured.
                 if conn.console is not None:
                     conn.console.close()
@@ -1404,6 +1459,8 @@ class DeviceConnectionManager:
                         conn.connection.disconnect()
                 except Exception:  # noqa: BLE001
                     pass
+                if conn.idle_log_stop is not None:
+                    conn.idle_log_stop.set()
                 if conn.console is not None:
                     conn.console.close()
                 self._connections.pop(key, None)
