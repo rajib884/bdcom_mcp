@@ -16,6 +16,7 @@ from device_mcp.connection import (
     _ConsoleRingLog,
     _classify_prompt,
     _classify_session,
+    _describe_mode,
     _detect_device_error,
     _dialect_hint,
     _parse_help_tokens,
@@ -27,16 +28,11 @@ from device_mcp.server import mcp
 EXPECTED_TOOLS = {
     "connect_device",
     "execute_command",
-    "configure_device",
     "disconnect_device",
     "list_connections",
     "get_console_history",
     "read_console_stream",
     "get_help",
-    "transfer_file",
-    "upgrade_firmware",
-    "enter_monitor_mode",
-    "recover_firmware",
 }
 
 
@@ -236,6 +232,20 @@ def check_diagnostics() -> None:
     assert _classify_prompt("R1(config)#") == "config"
     assert _classify_prompt("R1#") == "enable"
 
+    # _describe_mode names the sub-mode; the hostname is arbitrary.
+    assert _describe_mode("Switch>") == "user"
+    assert _describe_mode("Switch#") == "enable"
+    assert _describe_mode("Switch_config#") == "config"
+    assert _describe_mode("Switch_config_g0/1#") == "config: interface g0/1"
+    assert _describe_mode("Switch_config_vlan30#") == "config: vlan 30"
+    assert _describe_mode("Switch_config_v1#") == "config: vlan 1"
+    assert _describe_mode("Switch_config_line#") == "config: line"
+    assert _describe_mode("monitor#") == "monitor"
+    assert _describe_mode("R1(config)#") == "config"
+    assert _describe_mode("R1(config-if)#") == "config: if"
+    assert _describe_mode("Core-SW9#") == "enable"  # arbitrary hostname
+    assert _describe_mode("Core-SW9_config_tg0/2#") == "config: interface tg0/2"
+
     tokens = _parse_help_tokens(
         "  interface                  -- Interface status\n"
         "  ip                         -- IP config\n"
@@ -287,7 +297,8 @@ def check_configure() -> None:
     res2 = mgr.configure("h", ["switchport access vlan 30"], port=24)
     assert "[device-mcp] FAILED:" in res2, res2
     assert "switchport access vlan 30" in res2, res2
-    assert "(config)" in res2, res2   # reports it ended in a config submode
+    # Footer names the exact sub-mode it was left in, not just "(config)".
+    assert "(config: vlan 30)" in res2, res2
     print("configure: OK")
 
 
@@ -515,16 +526,61 @@ def check_execute_raw_monitor() -> None:
     """At monitor#, the normal path fails (stale 'Switch.*' prompt); raw works."""
     mgr = DeviceConnectionManager()
     _attach(mgr, "h:23", _FakeMonitor())
-    nonraw = mgr.execute_command("h", "reboot", expect_string=r"\(y/n\)",
+    nonraw = mgr.execute_command("h", "reboot", expect_regex=r"\(y/n\)",
                                  answer="y", port=23)
     assert "FAILED" in nonraw, nonraw          # demonstrates the stuck-prompt bug
 
     _attach(mgr, "h:24", _FakeMonitor())
-    raw = mgr.execute_command("h", "reboot", expect_string=r"\(y/n\)", answer="y",
-                              port=24, raw=True)
+    raw = mgr.execute_command("h", "reboot", mode="raw", expect_regex=r"\(y/n\)",
+                              answer="y", port=24)
     assert "Please wait" in raw, raw           # the reboot actually ran
     assert "now: monitor#" in raw, raw
     print("execute_command raw (monitor): OK")
+
+
+def check_run_commands() -> None:
+    """The merged execute_command entry point: list dispatch for config vs exec."""
+    mgr = DeviceConnectionManager()
+
+    # mode=config -> one atomic block via send_config_set.
+    net = _FakeNet(output="", prompt="Switch#")
+    _attach(mgr, "h:23", net)
+    res = mgr.run_commands("h", ["vlan 30", "exit"], mode="config", port=23)
+    assert net.config_calls, "config list did not go through send_config_set"
+    assert "applied 2 command(s)" in res, res
+
+    # exec mode -> each command runs sequentially, each with its own footer.
+    net2 = _FakeNet(output="...ok", prompt="Switch#")
+    _attach(mgr, "h:24", net2)
+    res2 = mgr.run_commands("h", ["show version", "show clock"], port=24)
+    assert net2.sent == ["show version", "show clock"], net2.sent
+    assert res2.count("[device-mcp]") == 2, res2
+
+    # empty list is rejected.
+    _attach(mgr, "h:25", _FakeNet(prompt="Switch#"))
+    try:
+        mgr.run_commands("h", [], port=25)
+        raise SystemExit("expected error for empty commands")
+    except RuntimeError as exc:
+        assert "at least one" in str(exc), exc
+    print("run_commands (merged exec/config): OK")
+
+
+def check_console_ring_tee(tmp_path: str = "logs/_smoke_tee_test.log") -> None:
+    """_ConsoleRingLog tees writes to its file as well as the in-memory ring."""
+    import os
+
+    os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+    fh = open(tmp_path, "w", encoding="utf-8")
+    ring = _ConsoleRingLog(file=fh)
+    ring.write(b"Switch>\n")
+    ring.write("enable\n")
+    ring.close()  # flushes + closes the file
+    with open(tmp_path, encoding="utf-8") as f:
+        contents = f.read()
+    assert "Switch>" in contents and "enable" in contents, contents
+    os.remove(tmp_path)
+    print("_ConsoleRingLog file tee: OK")
 
 
 def check_recover_firmware_guard() -> None:
@@ -572,23 +628,19 @@ async def main() -> None:
     assert "host" in required
     assert "username" not in required and "password" not in required, required
 
-    # execute_command: interactive + port params surfaced; default mode is auto.
+    # execute_command: now the merged tool - takes a commands list, mode includes
+    # raw, default mode is auto, and interactive/port params are surfaced.
     execute = tools["execute_command"]
     eschema = getattr(execute, "parameters", None) or execute.inputSchema
     eparams = eschema["properties"]
     print("execute_command params:", sorted(eparams))
-    assert {"expect_string", "answer", "port"} <= set(eparams)
+    assert {"commands", "expect_regex", "answer", "port"} <= set(eparams)
     assert eparams["mode"].get("default") == "auto", eparams["mode"]
-
-    # configure_device: batch config tool with a commands list.
-    configure = tools["configure_device"]
-    fschema = getattr(configure, "parameters", None) or configure.inputSchema
-    print("configure_device params:", sorted(fschema["properties"]))
-    assert "commands" in fschema["properties"]
 
     check_resolve_platform()
     check_target()
     check_console_ring()
+    check_console_ring_tee()
     check_target_resolution()
     check_diagnostics()
     check_session_state()
@@ -596,6 +648,7 @@ async def main() -> None:
     check_execute_footer()
     check_session_terminated()
     check_configure()
+    check_run_commands()
     check_transfer_file()
     check_execute_raw_monitor()
     check_recover_firmware_guard()

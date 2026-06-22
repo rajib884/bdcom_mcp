@@ -14,6 +14,7 @@ ports stay independent.
 from __future__ import annotations
 
 import io
+import os
 import re
 import threading
 import time
@@ -34,8 +35,10 @@ from .bdcom import BdcomSSH, BdcomTelnet
 
 Protocol = Literal["ssh", "telnet"]
 # "auto" (the default) runs at the current privilege level without downgrading;
-# user/enable/config force that exact level.
-Mode = Literal["auto", "user", "enable", "config"]
+# user/enable/config force that exact level. "raw" drives the channel directly
+# (no mode switching, no netmiko prompt detection) for prompts netmiko doesn't
+# know - notably the bootloader "monitor#" shell.
+Mode = Literal["auto", "user", "enable", "config", "raw"]
 
 # Closed set of reportable session states for the footer's ``now:`` field. The
 # first three are normal CLI modes; ``monitor`` is the bootloader recovery shell;
@@ -194,6 +197,33 @@ def _dialect_hint(command: str) -> Optional[str]:
     return None
 
 
+def _open_audit_log(
+    host: str, port: int, device_type: str, protocol: str, when: datetime
+) -> tuple[Optional[Any], Optional[str]]:
+    """Open a per-connection audit log file and return ``(handle, path)``.
+
+    The full device I/O is teed here for later review. The directory is
+    ``$DEVICE_MCP_LOG_DIR`` (default ``./logs``); the file is
+    ``<host>_<port>_<YYYYmmddTHHMMSSZ>.log`` (Windows-safe). Best effort - returns
+    ``(None, None)`` on any error so audit logging can never block a connection.
+    """
+    try:
+        log_dir = os.environ.get("DEVICE_MCP_LOG_DIR", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        safe_host = re.sub(r"[^A-Za-z0-9._-]", "_", host)
+        ts = when.strftime("%Y%m%dT%H%M%SZ")
+        path = os.path.join(log_dir, f"{safe_host}_{port}_{ts}.log")
+        handle = open(path, "a", encoding="utf-8")
+        handle.write(
+            f"# device-mcp session log - {host}:{port} ({device_type}/{protocol}) "
+            f"opened {when.isoformat()}\n"
+        )
+        handle.flush()
+        return handle, path
+    except Exception:  # noqa: BLE001 - logging must never block connecting
+        return None, None
+
+
 def _detect_device_error(output: str) -> Optional[dict[str, Any]]:
     """Find a device command-rejection in ``output``.
 
@@ -227,6 +257,64 @@ def _classify_prompt(prompt: str) -> str:
         return "user"
     if "_config" in p or "(config" in p:
         return "config"
+    if p.endswith("#"):
+        return "enable"
+    return "unknown"
+
+
+def _friendly_subcontext(sub: str) -> str:
+    """Render a config sub-mode token as a readable phrase (unknown tokens as-is).
+
+    e.g. ``g0/1`` -> ``interface g0/1``, ``vlan10``/``v10`` -> ``vlan 10``,
+    ``line`` -> ``line``, ``ospf 1`` -> ``ospf 1``.
+    """
+    s = sub.strip().rstrip("#> ")
+    low = s.lower()
+    if low == "line":
+        return "line"
+    if low.startswith("vlan") and low[4:].isdigit():
+        return f"vlan {low[4:]}"
+    if re.fullmatch(r"v\d+", low):
+        return f"vlan {low[1:]}"
+    # Interface tokens look like a short letter prefix then a number/slash
+    # (g0/1, gi0/1, tg0/1, f0/1, te0/1, ...). Pure name+number -> interface.
+    if re.fullmatch(r"[a-z]{1,3}\d[\d/.:]*", low):
+        return f"interface {s}"
+    return s
+
+
+def _describe_mode(prompt: str) -> str:
+    """Concise human label for a device prompt's mode/sub-mode. Pure.
+
+    The device name is arbitrary (set by ``hostname``); the mode lives in the prompt
+    suffix. Examples (not exhaustive)::
+
+        <name>>                -> user                    (User EXEC)
+        <name>#                -> enable                  (Privileged EXEC)
+        <name>_config#         -> config                  (global config)
+        <name>_config_g0/1#    -> config: interface g0/1
+        <name>_config_vlan10#  -> config: vlan 10
+        <name>_config_line#    -> config: line
+        monitor#               -> monitor                 (BootROM image recovery)
+
+    Any other ``_config_<x>`` (BDCOM) or ``(config-<x>)`` (Cisco) sub-mode is reported
+    as ``config: <x>``, so an unlisted feature sub-mode is still described, not lost.
+    """
+    p = prompt.strip()
+    if _MONITOR_PROMPT_RE.search(p):
+        return "monitor"
+    # Cisco style: "name(config)#" / "name(config-if)#".
+    m = re.search(r"\(config(?:-(?P<sub>[^)]+))?\)", p)
+    if m:
+        sub = m.group("sub")
+        return f"config: {_friendly_subcontext(sub)}" if sub else "config"
+    # BDCOM style: "name_config#" / "name_config_g0/1#".
+    m = re.search(r"_config(?:_(?P<sub>.+?))?[#>]?\s*$", p)
+    if m:
+        sub = m.group("sub")
+        return f"config: {_friendly_subcontext(sub)}" if sub else "config"
+    if p.endswith(">"):
+        return "user"
     if p.endswith("#"):
         return "enable"
     return "unknown"
@@ -352,13 +440,15 @@ def _footer(
 ) -> str:
     """Build the single-line ``[device-mcp]`` status footer appended to output.
 
-    The ``now:`` field shows the live prompt only for a recognized CLI/monitor mode;
-    any abnormal state is reported by name (e.g. ``now: awaiting_login``) so leftover
-    read-buffer text can never leak in as a bogus "mode". An optional ``hint``
-    (a Cisco->BDCOM gotcha) is appended after the head.
+    The ``now:`` field shows the live prompt and a parsed mode label for a recognized
+    CLI/monitor mode - including the config *sub-mode* (e.g. ``(config: interface
+    g0/1)``) so the caller knows exactly where the CLI is. Any abnormal state is
+    reported by name (e.g. ``now: awaiting_login``) so leftover read-buffer text can
+    never leak in as a bogus "mode". An optional ``hint`` (a Cisco->BDCOM gotcha) is
+    appended after the head.
     """
     if prompt and state in ("user", "enable", "config", "monitor"):
-        where = f"now: {prompt} ({state})"
+        where = f"now: {prompt} ({_describe_mode(prompt)})"
     else:
         where = f"now: {state}"
     if terminated:
@@ -418,18 +508,21 @@ def resolve_platform(device_type: str, protocol: Protocol) -> tuple[str, Any]:
 
 
 class _ConsoleRingLog(io.BufferedIOBase):
-    """A bounded, in-memory session log for netmiko.
+    """A bounded, in-memory session log for netmiko, optionally teed to a file.
 
     netmiko's ``session_log`` accepts any :class:`io.BufferedIOBase`; it writes raw
     channel traffic (and, with ``session_log_record_writes``, our writes too) here
     as UTF-8 bytes. We keep only the last ``maxlen`` lines so the buffer can't grow
-    without bound, then hand them back via :meth:`text` for console auditing.
+    without bound, then hand them back via :meth:`text` for console auditing. When a
+    ``file`` is given, the same text is also appended to it (unbounded) as a durable
+    per-connection audit log; :meth:`close` flushes and closes that file.
     """
 
-    def __init__(self, maxlen: int = 2000) -> None:
+    def __init__(self, maxlen: int = 2000, file: Optional[Any] = None) -> None:
         super().__init__()
         self._lines: deque[str] = deque(maxlen=maxlen)
         self._partial = ""
+        self._file = file
 
     def writable(self) -> bool:
         return True
@@ -443,6 +536,12 @@ class _ConsoleRingLog(io.BufferedIOBase):
         parts = (self._partial + text).split("\n")
         self._partial = parts.pop()
         self._lines.extend(parts)
+        if self._file is not None:
+            try:
+                self._file.write(text)
+                self._file.flush()
+            except Exception:  # noqa: BLE001 - never let audit logging break I/O
+                pass
         return len(b)
 
     def text(self, limit: int | None = 100) -> str:
@@ -452,6 +551,16 @@ class _ConsoleRingLog(io.BufferedIOBase):
         if limit is not None and limit >= 0:
             lines = lines[-limit:]
         return "\n".join(lines)
+
+    def close(self) -> None:  # type: ignore[override]
+        if self._file is not None:
+            try:
+                self._file.flush()
+                self._file.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._file = None
+        super().close()
 
 
 @dataclass
@@ -465,6 +574,7 @@ class DeviceConnection:
     connected_at: datetime = field(default_factory=_now)
     last_activity: datetime = field(default_factory=_now)
     current_mode: Mode = "user"
+    log_path: Optional[str] = None
 
 
 class DeviceConnectionManager:
@@ -511,7 +621,11 @@ class DeviceConnectionManager:
             except ValueError as exc:
                 return self._failure(host, str(exc), port=resolved_port)
 
-            console = _ConsoleRingLog()
+            opened = _now()
+            log_file, log_path = _open_audit_log(
+                host, resolved_port, device_type, protocol, opened
+            )
+            console = _ConsoleRingLog(file=log_file)
             params: dict[str, Any] = {
                 "host": host,
                 "port": resolved_port,
@@ -545,17 +659,20 @@ class DeviceConnectionManager:
                 # the caller can tell a bad password from a banner-only or
                 # specific-account login, instead of a bare "Login failed".
                 transcript = console.text(20).strip()
+                console.close()  # flush+close the audit log (keeps the transcript)
                 msg = f"Authentication failed: {exc}"
                 if transcript:
                     msg += f"\n--- last console output ---\n{transcript}"
                 return self._failure(host, msg, port=resolved_port)
             except NetmikoTimeoutException as exc:
                 transcript = console.text(20).strip()
+                console.close()
                 msg = f"Connection timed out: {exc}"
                 if transcript:
                     msg += f"\n--- last console output ---\n{transcript}"
                 return self._failure(host, msg, port=resolved_port)
             except Exception as exc:  # noqa: BLE001 - surface any transport error
+                console.close()
                 return self._failure(host, f"{type(exc).__name__}: {exc}", port=resolved_port)
 
             if auto_bypass_wizard:
@@ -571,6 +688,8 @@ class DeviceConnectionManager:
                 },
                 connection=connection,
                 console=console,
+                connected_at=opened,
+                log_path=log_path,
             )
             return {
                 "success": True,
@@ -581,18 +700,53 @@ class DeviceConnectionManager:
                 "host": host,
                 "port": resolved_port,
                 "target": target,
+                "log_file": log_path,
             }
 
     # ------------------------------------------------------------------ execute
+    def run_commands(
+        self,
+        host: str,
+        commands: list[str],
+        mode: Mode = "auto",
+        expect_regex: str | None = None,
+        answer: str | None = None,
+        port: int | None = None,
+    ) -> str:
+        """Run one or more commands and return their combined output + footers.
+
+        ``mode="config"`` applies the whole list atomically (``configure``); any other
+        mode runs the commands sequentially via :meth:`execute_command`. An interactive
+        ``expect_regex``/``answer`` is honored only for a lone command (a ``(y/n)``
+        confirm is inherently single-command). This is the single entry point the
+        ``execute_command`` tool exposes.
+        """
+        if not commands:
+            raise RuntimeError("'commands' must contain at least one command.")
+        if mode == "config":
+            return self.configure(host, commands, port)
+        single = len(commands) == 1
+        results = [
+            self.execute_command(
+                host,
+                cmd,
+                mode,
+                expect_regex if single else None,
+                answer if single else None,
+                port,
+            )
+            for cmd in commands
+        ]
+        return "\n\n".join(results)
+
     def execute_command(
         self,
         host: str,
         command: str,
         mode: Mode = "auto",
-        expect_string: str | None = None,
+        expect_regex: str | None = None,
         answer: str | None = None,
         port: int | None = None,
-        raw: bool = False,
     ) -> str:
         """Run a command and return its raw output plus a ``[device-mcp]`` footer.
 
@@ -600,12 +754,12 @@ class DeviceConnectionManager:
         error*, distinct from a transport failure) and where the CLI ended up
         (prompt + mode), so the caller can react without re-deriving session state.
 
-        Set ``raw=True`` to bypass mode switching and netmiko's prompt detection and
-        drive the channel directly - required at prompts netmiko doesn't know, e.g.
+        ``mode="raw"`` bypasses mode switching and netmiko's prompt detection and
+        drives the channel directly - required at prompts netmiko doesn't know, e.g.
         the bootloader ``monitor#`` shell, where the normal path waits forever for the
         device's usual ``Switch.*`` prompt and the command is never even sent. With
-        ``raw`` the ``mode`` argument is ignored; pass ``expect_string`` to stop on a
-        pattern (and ``answer`` to reply to a confirmation).
+        ``raw`` pass ``expect_regex`` to stop on a pattern (and ``answer`` to reply to
+        a confirmation).
         """
         with self._lock:
             conn = self._connections[self._resolve(host, port)]
@@ -616,8 +770,8 @@ class DeviceConnectionManager:
 
             net = conn.connection
             conn.last_activity = _now()
-            if raw:
-                return self._execute_raw(conn, command, expect_string, answer)
+            if mode == "raw":
+                return self._execute_raw(conn, command, expect_regex, answer)
             try:
                 self._switch_mode(conn, mode)
                 if mode == "config":
@@ -625,7 +779,7 @@ class DeviceConnectionManager:
                     output = net.send_command_timing(
                         command, read_timeout=_CONFIG_READ_TIMEOUT
                     )
-                elif expect_string and answer is not None:
+                elif expect_regex and answer is not None:
                     # Interactive confirmation (e.g. BDCOM "(y/n)"): send the
                     # command, wait for the prompt, then answer it. Capture the
                     # answer's full aftermath (e.g. the "System is rebooting" banner)
@@ -634,7 +788,7 @@ class DeviceConnectionManager:
                     # misleadingly empty result.
                     output = net.send_command(
                         command,
-                        expect_string=expect_string,
+                        expect_string=expect_regex,
                         read_timeout=_EXEC_READ_TIMEOUT,
                         auto_find_prompt=False,
                     )
@@ -675,7 +829,7 @@ class DeviceConnectionManager:
         self,
         conn: DeviceConnection,
         command: str,
-        expect_string: str | None,
+        expect_regex: str | None,
         answer: str | None,
     ) -> str:
         """Send ``command`` with raw channel I/O - no mode switching, no reliance on
@@ -688,9 +842,9 @@ class DeviceConnectionManager:
                 net.read_channel()  # drain residue
             except Exception:  # noqa: BLE001
                 pass
-            pat = re.compile(expect_string) if expect_string else None
+            pat = re.compile(expect_regex) if expect_regex else None
             output = _send_and_read(net, command, pat, timeout=_EXEC_READ_TIMEOUT, idle=2.0)
-            if expect_string and answer is not None:
+            if expect_regex and answer is not None:
                 # Answer the confirmation, then drain the aftermath (e.g. the reboot
                 # banner) - the device may not return a clean prompt.
                 output += "\n" + _send_and_read(net, answer, None, timeout=8.0, idle=1.5)
@@ -998,7 +1152,7 @@ class DeviceConnectionManager:
         if not reboot:
             return transfer
         reboot_out = self.execute_command(
-            host, "reboot", expect_string=r"\(y/n\)", answer="y", port=port
+            host, "reboot", expect_regex=r"\(y/n\)", answer="y", port=port
         )
         return transfer.rstrip("\n") + "\n\n--- reboot ---\n" + reboot_out
 
@@ -1209,6 +1363,9 @@ class DeviceConnectionManager:
             except Exception as exc:  # noqa: BLE001
                 return self._failure(host, f"Error disconnecting from {key}: {exc}", port=port)
             finally:
+                # Close the audit log after netmiko's final writes are captured.
+                if conn.console is not None:
+                    conn.console.close()
                 self._connections.pop(key, None)
             return {
                 "success": True,
@@ -1216,6 +1373,7 @@ class DeviceConnectionManager:
                 "host": host,
                 "port": conn.config.get("port"),
                 "target": key,
+                "log_file": conn.log_path,
             }
 
     # -------------------------------------------------------------------- listing
@@ -1232,6 +1390,7 @@ class DeviceConnectionManager:
                     "current_mode": conn.current_mode,
                     "connected_at": conn.connected_at.isoformat(),
                     "last_activity": conn.last_activity.isoformat(),
+                    "log_file": conn.log_path,
                 }
                 for target, conn in self._connections.items()
             ]
@@ -1245,6 +1404,8 @@ class DeviceConnectionManager:
                         conn.connection.disconnect()
                 except Exception:  # noqa: BLE001
                     pass
+                if conn.console is not None:
+                    conn.console.close()
                 self._connections.pop(key, None)
 
     # --------------------------------------------------------------------- helpers

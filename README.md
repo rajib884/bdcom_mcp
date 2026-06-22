@@ -20,13 +20,13 @@ platform.
 - **🎯 Universal Command Execution**: Execute any device command through a single interface
 - **🔐 Mode Management**: `auto` default runs at the current privilege level without downgrading; `user`/`enable`/`config` force a level
 - **🧾 Self-describing results**: every command returns its raw output plus a `[device-mcp]` footer reporting device errors (vs transport failures) and where the CLI ended up — see [Result footer](#-result-footer)
-- **🧱 Batch Config**: `configure_device` applies an ordered command list atomically, handles sub-mode nesting, and reports the exact line that failed
+- **🧱 One-or-many commands**: `execute_command` takes a command **list**; `mode=config` applies it as an atomic block (sub-mode nesting handled, exact failing line reported), other modes run them in order
 - **🌐 Multi-Device Support**: Manage many devices at once — including several behind **one IP on different ports** (console/terminal servers), addressed as `host:port`
-- **✅ Interactive Confirmations**: Answer `(y/n)` / `[confirm]` prompts (e.g. `reboot`, `delete startup-config`) via `expect_string` + `answer`
-- **📜 Console Diagnostics**: Per-connection raw I/O history (`get_console_history`) and live stream reads (`read_console_stream`) for auditing logins, desyncs, and reboots
+- **✅ Interactive Confirmations**: Answer `(y/n)` / `[confirm]` prompts (e.g. `reboot`, `delete startup-config`) via `expect_regex` + `answer`
+- **📜 Console Diagnostics & audit logs**: live raw-I/O history (`get_console_history`) plus an always-on per-connection log file under `./logs` (`DEVICE_MCP_LOG_DIR` to relocate) capturing the full session for later audit
 - **❓ Inline Help**: Query CLI `?` help with `get_help` (parsed `options:` footer)
 - **💡 Dialect hints**: a rejected/aborted command that's a known Cisco-ism gets a `hint:` with the BDCOM equivalent; a dropped session is reported as `SESSION_TERMINATED`
-- **📦 File transfer & firmware**: `transfer_file` (TFTP/FTP config backup or image fetch), `upgrade_firmware`, and `recover_firmware` / `enter_monitor_mode` for bootloader-shell recovery of a unit that can't boot normally
+- **🛠 Raw mode**: `mode=raw` drives the channel directly for prompts netmiko doesn't know — e.g. rebooting from the bootloader `monitor#` shell
 - **🤖 AI-Friendly**: Natural language command translation through AI assistants
 - **📊 Connection Monitoring**: Track active connections and their status
 
@@ -111,66 +111,51 @@ Establish a connection to a network device.
 }
 ```
 
+**Audit log:** every connection's full device I/O (from the login banner through
+disconnect) is written to `./logs/<host>_<port>_<UTC-timestamp>.log` — the directory
+is overridable with the `DEVICE_MCP_LOG_DIR` env var. The path is returned as
+`log_file` in the connect result (and in `list_connections`). A failed connection
+still leaves its partial transcript on disk (handy for diagnosing a bad login).
+> ⚠️ These logs capture raw I/O and can contain plaintext credentials — treat the
+> `logs/` directory as sensitive (it is git-ignored).
+
 #### `execute_command`
-Execute a command on a connected device. Returns the **raw command output** plus a
-one-line `[device-mcp]` footer reporting any device error and where the CLI ended
-up (see [Result footer](#-result-footer)).
+Run **one or more** commands on a connected device. Returns each command's **raw
+output** plus a one-line `[device-mcp]` footer reporting any device error and where
+the CLI ended up (see [Result footer](#-result-footer)).
 
 **Parameters:**
 - `host` (required): Target device IP/hostname
-- `command` (required): Command to execute
-- `mode` (optional): `auto` (default), `user`, `enable`, or `config`. `auto` runs
-  at the current privilege level **without downgrading** (so `show` works on BDCOM,
-  which connects in enable); `user`/`enable`/`config` force that exact level. For
-  multi-step config prefer `configure_device`.
-- `expect_string` (optional): Regex for an interactive confirmation prompt
-- `answer` (optional): Reply to send when `expect_string` matches
-- `raw` (optional): Bypass mode switching and prompt detection, driving the channel
-  directly. Needed at prompts netmiko doesn't know — notably the bootloader
-  `monitor#` shell, where the normal path waits for the device's usual `Switch.*`
-  prompt and the `reboot` is never even sent. To reboot from monitor mode:
-  `raw=true`, `expect_string="\\(y/n\\)"`, `answer="y"`.
+- `commands` (required): Ordered list of commands. A single command is a one-item
+  list, e.g. `["show version"]`.
+- `mode` (optional): `auto` (default), `user`, `enable`, `config`, or `raw`.
+  - `auto` runs at the current privilege level **without downgrading** (so `show`
+    works on BDCOM, which connects in enable); `user`/`enable` force that level.
+  - **`config`** applies the whole list as one **atomic** config block (enters/exits
+    config mode, handles sub-mode prompts like `Switch_config_vlan30#`); a rejected
+    line is reported with which one failed and where the session was left — no
+    partial config applied silently. Send a sub-mode `exit` as its own list item
+    when moving between contexts.
+  - **`raw`** bypasses mode switching and prompt detection, driving the channel
+    directly — needed at prompts netmiko doesn't know, notably the bootloader
+    `monitor#` shell (where a normal `reboot` waits for the device's usual `Switch.*`
+    prompt and is never sent).
+- `expect_regex` (optional): Regex for an interactive confirmation prompt (honored
+  only when a single command is given)
+- `answer` (optional): Reply to send when `expect_regex` matches
 - `port` (optional): Required only when several devices share an IP
 
-**Example:**
+**Example (single show):**
 ```json
-{
-  "host": "192.168.1.1",
-  "command": "show version"
-}
+{ "host": "192.168.1.1", "commands": ["show version"] }
 ```
 
-**Interactive example (BDCOM reboot):**
+**Config block (BDCOM VLAN + access port):**
 ```json
 {
   "host": "192.168.100.34",
   "port": 10003,
-  "command": "reboot",
-  "mode": "enable",
-  "expect_string": "\\(y/n\\)",
-  "answer": "y"
-}
-```
-
-#### `configure_device`
-Apply a sequence of configuration commands as one block. Enters config mode, sends
-each command in order (handling sub-mode prompt changes like
-`Switch_config_vlan30#`), then exits config mode. If a command is rejected, the
-footer reports **which one** failed and where the session was left — no partial
-config applied silently.
-
-**Parameters:**
-- `host` (required): Target device IP/hostname
-- `commands` (required): Ordered list of config commands. Send a sub-mode `exit` as
-  its own list item when moving between contexts. A trailing `;` is **not** a
-  separator.
-- `port` (optional): Required only when several devices share an IP
-
-**Example (BDCOM VLAN + access port):**
-```json
-{
-  "host": "192.168.100.34",
-  "port": 10003,
+  "mode": "config",
   "commands": [
     "vlan 30", "exit",
     "interface GigaEthernet0/1",
@@ -178,6 +163,20 @@ config applied silently.
   ]
 }
 ```
+
+**Interactive (BDCOM reboot):**
+```json
+{
+  "host": "192.168.100.34",
+  "port": 10003,
+  "commands": ["reboot"],
+  "mode": "enable",
+  "expect_regex": "\\(y/n\\)",
+  "answer": "y"
+}
+```
+To reboot from the bootloader `monitor#` shell, use the same call with `"mode":
+"raw"`.
 
 #### `disconnect_device`
 Disconnect from a device.
@@ -216,6 +215,12 @@ input line so the next command runs cleanly. The footer lists the parsed next-to
 
 **Parameters:** `host` (required), `command_prefix` (optional, e.g. `"show "`),
 `port` (optional).
+
+---
+
+> **⚠️ The four file-transfer / firmware tools below are currently disabled**
+> (commented out in [`server.py`](device_mcp/server.py)). Their manager methods still
+> exist and are unit-tested; re-enable the `@mcp.tool` wrappers to expose them.
 
 #### `transfer_file`
 Run a BDCOM `copy <source> <destination> [server]` (config backup or image fetch)
@@ -275,6 +280,7 @@ session state:
 [device-mcp] device error: Unknown command near 'status' | hint: BDCOM has no 'show interface status'; use 'show ip interface brief'. | now: Switch# (enable)
 [device-mcp] SESSION_TERMINATED: device returned to login prompt — reconnect required | now: awaiting_login
 [device-mcp] FAILED: <transport exception> | now: <prompt|state>
+[device-mcp] applied 3 command(s) | now: Switch_config_g0/1# (config: interface g0/1)
 [device-mcp] options: interface, ip, ipv6 | now: Switch_config# (config)
 ```
 
@@ -286,10 +292,23 @@ session state:
   `ReadTimeout`, so a desync is immediately obvious.
 - **hint** — for a known Cisco→BDCOM gotcha (see the cheat-sheet below) the footer
   appends the right command to use; shown on a device error or `SESSION_TERMINATED`.
-- **now** — a closed set of states, never raw read-buffer text: `user` / `enable` /
-  `config` (with the live prompt, e.g. `now: Switch_config_vlan30# (config)`),
-  `monitor` for the bootloader shell, or `awaiting_login` / `session_terminated` /
-  `unknown`.
+- **now** — the live prompt plus a **parsed mode label** (never raw read-buffer
+  text). The mode is read from the prompt suffix (the hostname is arbitrary), and
+  config **sub-modes** are named so you know exactly where the CLI is:
+
+  | Prompt | `now:` label |
+  |---|---|
+  | `Switch>` | `user` |
+  | `Switch#` | `enable` |
+  | `Switch_config#` | `config` |
+  | `Switch_config_g0/1#` | `config: interface g0/1` |
+  | `Switch_config_vlan10#` | `config: vlan 10` |
+  | `Switch_config_line#` | `config: line` |
+  | `monitor#` | `monitor` (BootROM recovery) |
+
+  Any other `_config_<x>` / `(config-<x>)` sub-mode is reported as `config: <x>`.
+  Abnormal states with no usable prompt are reported by name instead:
+  `awaiting_login` / `session_terminated` / `unknown`.
 
 ### 💡 Usage Examples
 
@@ -325,7 +344,7 @@ ports, connect to each with its `port`, then address tools by `host` + `port`:
 ```
 connect_device  host=192.168.100.34  port=10003  device_type=bdcom  protocol=telnet
 connect_device  host=192.168.100.34  port=10004  device_type=bdcom  protocol=telnet
-execute_command host=192.168.100.34  port=10003  command="show version"
+execute_command host=192.168.100.34  port=10003  commands=["show version"]
 ```
 `list_connections` shows each as a distinct `target` (`192.168.100.34:10003`,
 `192.168.100.34:10004`). If a host has only one connection, `port` can be omitted.
@@ -401,8 +420,8 @@ it appends the right command as a `hint:`):
   on an interface **clears its existing IP/IPv6 addresses**. Set the VRF first, then
   (re-)apply the addresses.
 - **Sub-modes don't auto-exit:** `vlan X`, `interface X`, `ip vrf X` each open a
-  sub-mode; send an explicit `exit` between contexts — or just use
-  `configure_device` with the `exit` lines in the list.
+  sub-mode; send an explicit `exit` between contexts — `execute_command` with
+  `mode=config` and the `exit` lines in the list handles this.
 - **Privileged for `show`:** BDCOM `show` needs enable mode; the default `auto`
   mode keeps you there after connect, so no `mode` is needed.
 
@@ -499,14 +518,14 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 `username` / `password` 可选（用于无认证的控制台）；默认 BDCOM 进入 `enable` 无需密码。
 
 #### `execute_command`
-在已连接的设备上执行命令。`mode` 默认 `auto`（在当前权限级别执行、不降级；BDCOM 连接后处于
-enable，因此 `show` 可直接工作），也可强制 `user`/`enable`/`config`。返回原始输出加一行
-`[device-mcp]` footer（报告设备错误与当前提示符/模式）。支持 `expect_string` + `answer`
-应答交互式 `(y/n)` 确认；`port` 仅在同一 IP 有多台设备时需要。
-
-#### `configure_device`
-按顺序批量下发配置命令（自动进出配置模式，处理子模式提示符变化）。在上下文之间用单独的
-`exit` 列表项切换；若某条命令被拒绝，footer 会指出是哪一条以及会话停在何处。
+在已连接的设备上执行**一条或多条**命令（`commands` 为命令列表，单条命令用单元素列表）。
+`mode` 默认 `auto`（在当前权限级别执行、不降级；BDCOM 连接后处于 enable，`show` 可直接工作），
+也可强制 `user`/`enable`；**`config`** 将整个列表作为一个原子配置块下发（自动进出配置模式、
+处理子模式提示符；某条被拒绝时 footer 指出是哪一条且不会留下半套配置）；**`raw`** 直接驱动
+通道，用于 netmiko 不认识的提示符（如引导加载器 `monitor#`，普通 `reboot` 会一直等待
+`Switch.*` 提示符而发不出去）。返回每条命令的原始输出加一行 `[device-mcp]` footer。支持
+`expect_regex` + `answer` 应答交互式 `(y/n)` 确认（仅单条命令时生效）；`port` 仅在同一 IP
+有多台设备时需要。
 
 #### `disconnect_device`
 断开与设备的连接（同一 IP 多设备时需指定 `port`）。
@@ -539,7 +558,7 @@ Ctrl-Z 退出配置模式，特权模式用 `exit` 退出。BDCOM 不支持 `ter
 - 接入口 VLAN 用 `switchport mode access` + `switchport pvid <id>`（没有 `switchport access vlan`）。
 - VRF 必须先在 `ip vrf`/`ipv6 vrf` 内设置 `rd a:b` 再被引用，否则报 `does not have a RD`。
 - 在接口上设置 `vrf forwarding` 会清除其已配置的 IP/IPv6 地址——先设 VRF，再配地址。
-- 子模式（`vlan`/`interface`/`ip vrf`）不会自动退出，上下文之间需 `exit`，或用 `configure_device`。
+- 子模式（`vlan`/`interface`/`ip vrf`）不会自动退出，上下文之间需 `exit`，或用 `execute_command` 的 `mode=config`。
 
 ### 📝 许可证
 

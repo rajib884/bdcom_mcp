@@ -1,20 +1,20 @@
 """Device MCP Server (Python / FastMCP).
 
 A FastMCP server for managing network devices (Cisco IOS, BDCOM, and any other
-netmiko-supported platform) over SSH or Telnet. Exposes twelve tools:
+netmiko-supported platform) over SSH or Telnet. Exposes seven tools:
 
     * connect_device
-    * execute_command
-    * configure_device
+    * execute_command      - run one or more commands (mode=config = atomic block;
+                             mode=raw = drive the channel directly, e.g. monitor#)
     * disconnect_device
     * list_connections
     * get_console_history
     * read_console_stream
     * get_help
-    * transfer_file        - copy files over TFTP/FTP (config backup / image fetch)
-    * upgrade_firmware      - download an image to flash and reboot into it
-    * enter_monitor_mode    - drop into the bootloader 'monitor#' shell
-    * recover_firmware      - end-to-end monitor-mode firmware recovery
+
+The file-transfer / firmware tools (transfer_file, upgrade_firmware,
+enter_monitor_mode, recover_firmware) and their manager methods exist but are
+currently disabled (commented out below).
 
 Connections are addressed by host, plus a ``port`` that is required only when
 several devices share an IP (a console/terminal server).
@@ -49,11 +49,11 @@ def connect_device(
     host: Annotated[str, Field(description="IP address or hostname of the device")],
     username: Annotated[
         Optional[str],
-        Field(description="Username for authentication (optional for unsecured consoles)"),
+        Field(description="Username for authentication (optional)"),
     ] = None,
     password: Annotated[
         Optional[str],
-        Field(description="Password for authentication (optional for unsecured consoles)"),
+        Field(description="Password for authentication (optional)"),
     ] = None,
     device_type: Annotated[
         str,
@@ -73,8 +73,7 @@ def connect_device(
     ] = None,
     enable_password: Annotated[
         Optional[str],
-        Field(description="Enable password for privileged mode (optional; many "
-              "devices need none)"),
+        Field(description="Enable password for privileged mode (optional)"),
     ] = None,
 ) -> str:
     """Connect to a network device via SSH or Telnet.
@@ -99,80 +98,52 @@ def execute_command(
     host: Annotated[
         str, Field(description="IP address or hostname of the connected device")
     ],
-    command: Annotated[
-        str,
-        Field(
-            description='Command to execute (e.g., "show version", '
-            '"show ip interface brief")'
-        ),
-    ],
-    mode: Annotated[
-        Literal["auto", "user", "enable", "config"],
-        Field(
-            description="Execution mode: auto (default) runs at the current "
-            "privilege level without downgrading; user/enable/config force that "
-            "exact level. Use config for a single config command (prefer "
-            "configure_device for multi-step config)."
-        ),
-    ] = "auto",
-    expect_string: Annotated[
-        Optional[str],
-        Field(description="Regex pattern to expect for an interactive command "
-              "confirmation, e.g. '[y/n]' or '\\(y/n\\)' (optional)"),
-    ] = None,
-    answer: Annotated[
-        Optional[str],
-        Field(description="Answer to send in response to the confirmation prompt "
-              "(optional; pair with expect_string)"),
-    ] = None,
-    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
-    raw: Annotated[
-        bool,
-        Field(description="Bypass mode switching and prompt detection, driving the "
-              "channel directly. Needed at prompts netmiko doesn't know, e.g. the "
-              "bootloader 'monitor#' shell. With raw, 'mode' is ignored. Default false."),
-    ] = False,
-) -> str:
-    """Execute a command on a connected network device.
-
-    The device must be connected first using ``connect_device``. Returns the raw
-    command output followed by a ``[device-mcp]`` footer line reporting any device
-    error and where the CLI ended up (prompt + mode).
-    """
-    try:
-        return _manager.execute_command(
-            host, command, mode, expect_string, answer, port, raw
-        )
-    except Exception as exc:  # noqa: BLE001 - return AI-friendly error text
-        return f"Error: {exc}"
-
-
-@mcp.tool
-def configure_device(
-    host: Annotated[
-        str, Field(description="IP address or hostname of the connected device")
-    ],
     commands: Annotated[
         list[str],
         Field(
-            description="Ordered configuration commands. They are sent as one block "
-            "(config mode is entered/exited automatically). Send a sub-mode 'exit' "
-            "as its own list item when moving between contexts, e.g. "
-            '["vlan 30", "exit", "interface GigaEthernet0/1", "switchport mode '
-            'access", "exit"]. A trailing ";" is not a command separator.'
+            description='One or more commands to run, in order. A single command is a '
+            'one-item list, e.g. ["show version"]. With mode="config" the whole list '
+            "is applied as one atomic config block (config mode entered/exited "
+            "automatically; send a sub-mode 'exit' as its own item between contexts, "
+            'e.g. ["vlan 30", "exit", "interface GigaEthernet0/1", "switchport mode '
+            'access", "exit"]); in other modes the commands run sequentially.'
         ),
     ],
+    mode: Annotated[
+        Literal["auto", "user", "enable", "config", "raw"],
+        Field(
+            description="auto (default) runs at the current privilege level without "
+            "downgrading; user/enable/config force that level (config applies the "
+            "list as one atomic block); raw drives the channel directly (where a "
+            "normal command would wait for the device's usual 'Switch.*' prompt and "
+            "never be sent)."
+        ),
+    ] = "auto",
+    expect_regex: Annotated[
+        Optional[str],
+        Field(description="Regex to expect for an interactive confirmation, e.g. "
+              "'[y/n]' or '\\(y/n\\)'. Honored only when a single command is given."),
+    ] = None,
+    answer: Annotated[
+        Optional[str],
+        Field(description="Answer to send when expect_regex matches (pair with "
+              "expect_regex; single command)."),
+    ] = None,
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:
-    """Apply a sequence of configuration commands to a connected device.
+    """Execute one or more commands on a connected network device.
 
-    Enters config mode, sends each command in order (handling sub-mode prompt
-    changes), then exits config mode. Returns the combined output plus a
-    ``[device-mcp]`` footer; if a command is rejected the footer reports which one
-    failed and where the session was left, instead of applying a partial config.
+    The device must be connected first using ``connect_device``. Returns each
+    command's raw output followed by a ``[device-mcp]`` footer reporting any device
+    error (vs a transport failure) and where the CLI ended up (prompt + mode). With
+    ``mode="config"`` the whole list is applied atomically and a rejected line is
+    reported without leaving a partial config. To reboot from the ``monitor#`` shell,
+    pass ``mode="raw"`` with ``expect_regex="\\(y/n\\)"`` and ``answer="y"``.
     """
     try:
-        return _manager.configure(host, commands, port)
+        return _manager.run_commands(
+            host, commands, mode, expect_regex, answer, port
+        )
     except Exception as exc:  # noqa: BLE001 - return AI-friendly error text
         return f"Error: {exc}"
 
@@ -206,11 +177,7 @@ def get_console_history(
     ] = 100,
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:
-    """Return the last N lines of raw console I/O captured for a connection.
-
-    Useful for auditing logins, prompt-matching failures, and reboots. Note the
-    history may contain sensitive output (e.g. plaintext credentials in a config).
-    """
+    """Return the last N lines of raw console I/O captured for a connection."""
     try:
         return _manager.get_console_history(host, limit, port)
     except Exception as exc:  # noqa: BLE001
@@ -236,7 +203,7 @@ def read_console_stream(
     """Read live console output without sending a command.
 
     Accumulates whatever the device emits until ``expect_pattern`` matches or the
-    timeout elapses - handy for watching a reboot back to the login prompt.
+    timeout elapses.
     """
     try:
         return _manager.read_console_stream(host, expect_pattern, timeout, port)
@@ -345,73 +312,73 @@ def get_help(
 #         return f"Error: {exc}"
 
 
-@mcp.tool
-def enter_monitor_mode(
-    host: Annotated[
-        str, Field(description="IP address or hostname of the connected device")
-    ],
-    timeout: Annotated[
-        float,
-        Field(description="Max seconds to reach the monitor prompt (default 180)"),
-    ] = 180.0,
-    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
-) -> str:
-    """Drop the device into the bootloader ``monitor#`` shell.
+# @mcp.tool
+# def enter_monitor_mode(
+#     host: Annotated[
+#         str, Field(description="IP address or hostname of the connected device")
+#     ],
+#     timeout: Annotated[
+#         float,
+#         Field(description="Max seconds to reach the monitor prompt (default 180)"),
+#     ] = 180.0,
+#     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+# ) -> str:
+#     """Drop the device into the bootloader ``monitor#`` shell.
 
-    Two stages: (1) initiate a reboot — tries the hidden ``menu:`` reboot option
-    first (works even at a login prompt), falling back to ``reboot``+``y``; (2) after
-    ``RTC Test``, sends a short Ctrl-P burst to interrupt the boot into monitor mode.
-    Returns the boot transcript plus a footer (``now: monitor#`` on success).
-    """
-    try:
-        return _manager.enter_monitor_mode(host, timeout=timeout, port=port)
-    except Exception as exc:  # noqa: BLE001
-        return f"Error: {exc}"
+#     Two stages: (1) initiate a reboot — tries the hidden ``menu:`` reboot option
+#     first (works even at a login prompt), falling back to ``reboot``+``y``; (2) after
+#     ``RTC Test``, sends a short Ctrl-P burst to interrupt the boot into monitor mode.
+#     Returns the boot transcript plus a footer (``now: monitor#`` on success).
+#     """
+#     try:
+#         return _manager.enter_monitor_mode(host, timeout=timeout, port=port)
+#     except Exception as exc:  # noqa: BLE001
+#         return f"Error: {exc}"
 
 
-@mcp.tool
-def recover_firmware(
-    host: Annotated[
-        str, Field(description="IP address or hostname of the connected device")
-    ],
-    image_url: Annotated[
-        str,
-        Field(description="Firmware image as a tftp: source — the bootloader monitor "
-              "'copy' only accepts tftp: (an ftp:// URL is rejected) and caps the name "
-              "at 60 chars. This fleet's relay shorthand is "
-              "'tftp:f::<last-chars-of-ftp-dir>/<file>', e.g. "
-              "'tftp:f::53/BD_3954_interAptiv_2.2.0F_154634.bin' for FTP dir "
-              "/BDCOM0053/. Using 'f::' will relay the file from the FTP server and serve over TFTP."),
-    ],
-    server: Annotated[
-        str, Field(description="TFTP (also FTP-relay) server IP appended to the 'copy' "
-              "command")
-    ],
-    monitor_ip: Annotated[
-        str,
-        Field(description="IP to assign the unit in monitor mode so it can reach the "
-              "TFTP/FTP-relay server, e.g. 170.170.170.183"),
-    ],
-    mask: Annotated[
-        str, Field(description='Subnet mask for monitor_ip (default "255.255.255.0")'),
-    ] = "255.255.255.0",
-    flash_name: Annotated[
-        str, Field(description='Destination filename in flash (default "switch.bin")'),
-    ] = "switch.bin",
-    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
-) -> str:
-    """Firmware recovery/upgrade via the bootloader ``monitor#`` shell.
+# @mcp.tool
+# def recover_firmware(
+#     host: Annotated[
+#         str, Field(description="IP address or hostname of the connected device")
+#     ],
+#     image_url: Annotated[
+#         str,
+#         Field(description="Firmware image as a tftp: source — the bootloader monitor "
+#               "'copy' only accepts tftp: (an ftp:// URL is rejected) and caps the name "
+#               "at 60 chars. This fleet's relay shorthand is "
+#               "'tftp:f::<last-chars-of-ftp-dir>/<file>', e.g. "
+#               "'tftp:f::53/BD_3954_interAptiv_2.2.0F_154634.bin' for FTP dir "
+#               "/BDCOM0053/. Using 'f::' will relay the file from the FTP server and serve over TFTP."),
+#     ],
+#     server: Annotated[
+#         str, Field(description="TFTP (also FTP-relay) server IP appended to the 'copy' "
+#               "command")
+#     ],
+#     monitor_ip: Annotated[
+#         str,
+#         Field(description="IP to assign the unit in monitor mode so it can reach the "
+#               "TFTP/FTP-relay server, e.g. 170.170.170.183"),
+#     ],
+#     mask: Annotated[
+#         str, Field(description='Subnet mask for monitor_ip (default "255.255.255.0")'),
+#     ] = "255.255.255.0",
+#     flash_name: Annotated[
+#         str, Field(description='Destination filename in flash (default "switch.bin")'),
+#     ] = "switch.bin",
+#     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+# ) -> str:
+#     """Firmware recovery/upgrade via the bootloader ``monitor#`` shell.
 
-    For a unit too broken to upgrade normally: enters monitor mode, assigns
-    ``monitor_ip``, recovers the image to flash, and reboots into it. Aborts if
-    monitor mode isn't reached or the flash transfer doesn't confirm.
-    """
-    try:
-        return _manager.recover_firmware(
-            host, image_url, server, monitor_ip, mask, flash_name, port
-        )
-    except Exception as exc:  # noqa: BLE001
-        return f"Error: {exc}"
+#     For a unit too broken to upgrade normally: enters monitor mode, assigns
+#     ``monitor_ip``, recovers the image to flash, and reboots into it. Aborts if
+#     monitor mode isn't reached or the flash transfer doesn't confirm.
+#     """
+#     try:
+#         return _manager.recover_firmware(
+#             host, image_url, server, monitor_ip, mask, flash_name, port
+#         )
+#     except Exception as exc:  # noqa: BLE001
+#         return f"Error: {exc}"
 
 
 def main() -> None:

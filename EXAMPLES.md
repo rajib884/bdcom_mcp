@@ -54,7 +54,7 @@ each is a distinct `host:port` connection:
   "tool": "execute_command",
   "arguments": {
     "host": "192.168.1.1",
-    "command": "show version",
+    "commands": ["show version"],
     "mode": "user"
   }
 }
@@ -65,23 +65,25 @@ each is a distinct `host:port` connection:
   "tool": "execute_command",
   "arguments": {
     "host": "192.168.1.1",
-    "command": "show ip interface brief",
+    "commands": ["show ip interface brief", "show vlan"],
     "mode": "enable"
   }
 }
 ```
 
-### 3. Configuration â€” prefer `configure_device` for multi-step
+### 3. Configuration — `execute_command` with `mode: "config"`
 
-Send an ordered command list as one block; config mode is entered/exited
-automatically and sub-mode prompt changes are handled. Put an `exit` as its own
-list item when moving between contexts:
+Send an ordered command list with `mode: "config"`; it is applied as one block
+(config mode entered/exited automatically, sub-mode prompt changes handled), and a
+rejected line is reported with exactly which one failed — no partial config. Put an
+`exit` as its own list item when moving between contexts:
 
 ```json
 {
-  "tool": "configure_device",
+  "tool": "execute_command",
   "arguments": {
     "host": "192.168.1.1",
+    "mode": "config",
     "commands": [
       "interface GigabitEthernet0/1",
       "ip address 10.1.1.1 255.255.255.0",
@@ -92,15 +94,6 @@ list item when moving between contexts:
 }
 ```
 
-A single config line can still go through `execute_command` with `mode: "config"`,
-but for sequences `configure_device` reports exactly which line failed:
-
-```json
-{ "tool": "configure_device",
-  "arguments": { "host": "192.168.1.1",
-                 "commands": ["interface GigabitEthernet0/1", "no shutdown", "exit"] } }
-```
-
 #### BDCOM VLAN + SVI + VRF (ordering matters)
 
 `switchport pvid` (not `switchport access vlan`); set the VRF `rd` before using the
@@ -108,10 +101,11 @@ VRF; set `vrf forwarding` **before** the interface addresses (it clears them):
 
 ```json
 {
-  "tool": "configure_device",
+  "tool": "execute_command",
   "arguments": {
     "host": "192.168.100.34",
     "port": 10003,
+    "mode": "config",
     "commands": [
       "vlan 30", "exit",
       "ipv6 vrf VRF30", "rd 30:30", "exit",
@@ -128,7 +122,7 @@ VRF; set `vrf forwarding` **before** the interface addresses (it clears them):
 ### 4. Interactive Commands (confirmations)
 
 Commands that wait for a `(y/n)` / `[confirm]` answer (e.g. `reboot`,
-`delete startup-config`) use `expect_string` (a regex) + `answer`. Include `port`
+`delete startup-config`) use `expect_regex` (a regex) + `answer`. Include `port`
 when the device shares its IP with others:
 ```json
 {
@@ -136,9 +130,9 @@ when the device shares its IP with others:
   "arguments": {
     "host": "192.168.100.34",
     "port": 10003,
-    "command": "reboot",
+    "commands": ["reboot"],
     "mode": "enable",
-    "expect_string": "\\(y/n\\)",
+    "expect_regex": "\\(y/n\\)",
     "answer": "y"
   }
 }
