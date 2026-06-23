@@ -350,11 +350,33 @@ def _describe_session(
 ) -> tuple[Optional[str], SessionState]:
     """Return ``(prompt, state)`` for the footer, never leaking raw buffer text.
 
-    Trusts ``find_prompt()`` only when it yields a real CLI/monitor prompt; for an
-    abnormal or unreadable prompt it scans the tail of the console ring (which has
-    already captured a ``Username:``/"logged out" line even when ``find_prompt``
-    times out) so the state is classified rather than guessed.
+    Reads the current prompt straight from the console ring - the device already
+    echoed it as the command's read completed - instead of issuing a fresh
+    ``find_prompt()``. That probe writes a bare carriage return the device echoes
+    back, and netmiko retries it up to a dozen times when a prompt is slow, which
+    is the dominant source of blank-line/duplicate-prompt noise in the log. Only
+    when the ring is unavailable or its tail is inconclusive do we actively probe.
     """
+    if console is not None:
+        tail = console.text(20)
+        stripped = tail.strip()
+        last = stripped.splitlines()[-1].strip() if stripped else ""
+        if last:
+            # A clean CLI/monitor prompt on the last line means we are sitting at a
+            # working prompt now; any login banner higher up the tail is history.
+            if _MONITOR_PROMPT_RE.search(last):
+                return last, "monitor"
+            mode = _classify_prompt(last)
+            if mode in ("user", "enable", "config"):
+                return last, mode  # type: ignore[return-value]
+        # Last line is not a normal prompt: scan the recent tail for the abnormal
+        # states (login / logout / monitor) a bare prompt classifier would miss.
+        scanned = _classify_session(tail)
+        if scanned in ("awaiting_login", "session_terminated"):
+            return None, scanned
+        if scanned == "monitor":
+            return last or None, scanned
+        # else: inconclusive - fall through to an active probe as a last resort.
     try:
         prompt: Optional[str] = net.find_prompt()
     except Exception:  # noqa: BLE001
@@ -366,10 +388,6 @@ def _describe_session(
         if state != "unknown":
             # A login/auth/logout prompt: report the state, never the raw text.
             return None, state
-    if console is not None:
-        scanned = _classify_session(console.text(20))
-        if scanned != "unknown":
-            return None, scanned
     return None, "unknown"
 
 
@@ -1364,9 +1382,18 @@ class DeviceConnectionManager:
             # Run at the current privilege level: de-nest config submodes but do
             # not downgrade. BDCOM lands in enable at connect (our driver), so
             # 'show' works here; a Cisco user-exec session stays user-exec.
-            if net.check_config_mode():
+            #
+            # Trust the tracked mode - _describe_session refreshes it from the real
+            # prompt after every command - rather than probing with check_*_mode(),
+            # which each write a bare return the device echoes back as prompt noise.
+            if conn.current_mode == "config":
                 net.exit_config_mode()
-            conn.current_mode = "enable" if net.check_enable_mode() else "user"
+                conn.current_mode = "enable"  # exiting config returns to enable
+            elif conn.current_mode not in ("user", "enable"):
+                # Unknown/never-run: probe once to establish the level.
+                if net.check_config_mode():
+                    net.exit_config_mode()
+                conn.current_mode = "enable" if net.check_enable_mode() else "user"
 
         elif target == "enable":
             if net.check_config_mode():
