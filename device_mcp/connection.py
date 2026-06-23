@@ -533,8 +533,9 @@ class _ConsoleRingLog(io.BufferedIOBase):
     """A bounded, in-memory session log for netmiko, optionally teed to a file.
 
     netmiko's ``session_log`` accepts any :class:`io.BufferedIOBase`; it writes raw
-    channel traffic (and, with ``session_log_record_writes``, our writes too) here
-    as UTF-8 bytes. We keep only the last ``maxlen`` lines so the buffer can't grow
+    channel reads here as UTF-8 bytes (we leave ``session_log_record_writes`` off so
+    echoed input isn't logged twice). We keep only the last ``maxlen`` lines so the
+    buffer can't grow
     without bound, then hand them back via :meth:`text` for console auditing. When a
     ``file`` is given, the same text is also appended to it (unbounded) as a durable
     per-connection audit log; :meth:`close` flushes and closes that file.
@@ -655,7 +656,13 @@ class DeviceConnectionManager:
                 "port": resolved_port,
                 "conn_timeout": 30,
                 "session_log": console,
-                "session_log_record_writes": True,
+                # Don't record our channel writes: these CLIs echo typed input, so
+                # netmiko's read capture already contains every command (prefixed by
+                # the live prompt, e.g. "Switch#show version"). Recording writes too
+                # logged each command a second time as a bare, prompt-less line. The
+                # only writes this drops from the audit log are non-echoed ones -
+                # credentials (already masked) and raw control bytes (Ctrl-Z/Ctrl-P).
+                "session_log_record_writes": False,
             }
             # username/password are optional: unsecured console/terminal-server
             # ports may need neither. Only pass what was supplied.
