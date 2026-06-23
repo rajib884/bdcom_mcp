@@ -14,7 +14,7 @@ Thank you for your interest in contributing to the Device MCP Server! This docum
 
 1. **Fork and Clone**
    ```bash
-   git clone https://github.com/your-username/cisco-mcp.git device-mcp
+   git clone https://github.com/your-username/bdcom_mcp.git device-mcp
    cd device-mcp
    ```
 

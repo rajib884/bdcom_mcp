@@ -40,7 +40,7 @@ platform.
 
 1. **Clone and Install**
    ```bash
-   git clone https://github.com/very99/cisco-mcp.git device-mcp
+   git clone https://github.com/rajib884/bdcom_mcp.git device-mcp
    cd device-mcp
    python -m venv .venv
    # Windows:  .venv\Scripts\activate
@@ -483,7 +483,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 1. **克隆并安装**
    ```bash
-   git clone https://github.com/very99/cisco-mcp.git device-mcp
+   git clone https://github.com/rajib884/bdcom_mcp.git device-mcp
    cd device-mcp
    python -m venv .venv
    # Windows:  .venv\Scripts\activate
