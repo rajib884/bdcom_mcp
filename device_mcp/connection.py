@@ -117,6 +117,44 @@ _LOGGED_OUT_RE = re.compile(r"(?i)logged out|User .*? logged out")
 # The BDCOM bootloader recovery shell prompt (e.g. "monitor#").
 _MONITOR_PROMPT_RE = re.compile(r"(?im)^\s*monitor\s*#")
 
+# Built-in matcher for the common interactive confirmation prompts (BDCOM/Cisco):
+# "(y/n)", "[yes/no]", "[confirm]", etc. Used when an ``answer`` is supplied without
+# an explicit ``expect_regex`` so callers never have to hand-write - and JSON-escape -
+# a regex just to answer a reboot/reload/clear confirmation. The escaped parens are a
+# frequent source of invalid JSON (``"\(y/n\)"`` is not a legal JSON string), which is
+# exactly the friction this default removes.
+_DEFAULT_CONFIRM_RE = (
+    r"(?i)([\(\[]\s*(?:y|yes)\s*/\s*(?:n|no)\s*[\)\]]|\[\s*confirm\s*\])"
+)
+
+
+def _safe_expect(pattern: str) -> str:
+    """Return a pattern safe to use as a regex, falling back to a literal match.
+
+    Callers may pass a plain substring (e.g. ``(y/n)``) rather than a real regex; if
+    it does not compile, match it literally instead of erroring. This also means a
+    caller never needs regex backslash escapes - which, single-escaped, produce
+    invalid JSON over the wire."""
+    try:
+        re.compile(pattern)
+        return pattern
+    except re.error:
+        return re.escape(pattern)
+
+
+def _resolve_confirm(expect_regex: Optional[str], answer: Optional[str]) -> Optional[str]:
+    """Resolve the effective confirmation matcher for an interactive command.
+
+    A caller-supplied ``expect_regex`` is honored (made literal-safe). When an
+    ``answer`` is given with no pattern, fall back to :data:`_DEFAULT_CONFIRM_RE` so a
+    standard ``(y/n)``/``[confirm]`` prompt is matched automatically - the caller only
+    has to say what to answer, not how to recognize the prompt."""
+    if expect_regex:
+        return _safe_expect(expect_regex)
+    if answer is not None:
+        return _DEFAULT_CONFIRM_RE
+    return None
+
 # Known Cisco-isms that BDCOM rejects (or, worse, mishandles). When a command is
 # rejected or kills the session, the matching hint is surfaced in the footer so the
 # caller doesn't have to know BDCOM's dialect. Each is justified by conn2.log, the
@@ -848,8 +886,11 @@ class DeviceConnectionManager:
 
             net = conn.connection
             conn.last_activity = _now()
+            # Resolve the confirmation matcher once: an explicit (literal-safe) pattern,
+            # or the built-in default when only an answer was supplied.
+            expect = _resolve_confirm(expect_regex, answer)
             if mode == "raw":
-                return self._execute_raw(conn, command, expect_regex, answer)
+                return self._execute_raw(conn, command, expect, answer)
             try:
                 self._switch_mode(conn, mode)
                 if mode == "config":
@@ -857,16 +898,17 @@ class DeviceConnectionManager:
                     output = net.send_command_timing(
                         command, read_timeout=_CONFIG_READ_TIMEOUT
                     )
-                elif expect_regex and answer is not None:
-                    # Interactive confirmation (e.g. BDCOM "(y/n)"): send the
-                    # command, wait for the prompt, then answer it. Capture the
-                    # answer's full aftermath (e.g. the "System is rebooting" banner)
-                    # via a raw drain instead of a second send_command, which would
-                    # wait for a clean prompt that a reboot never returns - leaving a
-                    # misleadingly empty result.
+                elif answer is not None:
+                    # Interactive confirmation (e.g. BDCOM "(y/n)"): send the command,
+                    # wait for the confirmation prompt (the caller's pattern or the
+                    # built-in default), then answer it. Capture the answer's full
+                    # aftermath (e.g. the "System is rebooting" banner) via a raw drain
+                    # instead of a second send_command, which would wait for a clean
+                    # prompt that a reboot never returns - leaving a misleadingly empty
+                    # result.
                     output = net.send_command(
                         command,
-                        expect_string=expect_regex,
+                        expect_string=expect,
                         read_timeout=_EXEC_READ_TIMEOUT,
                         auto_find_prompt=False,
                     )

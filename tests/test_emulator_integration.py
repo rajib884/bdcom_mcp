@@ -177,6 +177,46 @@ def test_get_help_custom_listing(manager, make_switch):
     assert "options: route, ospf" in out
 
 
+# ------------------------------------------------------- interactive confirm
+
+def _reboot_switch(make_switch):
+    return make_switch(confirmations={"reboot": {
+        "prompt": "Do you want to reboot the Switch(y/n)?",
+        "answers": {"y": "System is rebooting...", "n": "Reboot canceled."},
+    }})
+
+
+def test_confirmation_declined_with_answer_only(manager, make_switch):
+    """answer='n' alone declines a (y/n) prompt - no expect_regex needed.
+
+    This is the scenario that previously forced an invalid-JSON regex (``\\(y/n\\)``):
+    now the standard prompt is auto-detected from the answer.
+    """
+    sw = _reboot_switch(make_switch)
+    _connect(manager, sw)
+    out = manager.execute_command(HOST, "reboot", answer="n", port=sw.port)
+    assert "Reboot canceled" in out
+    assert "rebooting" not in out.lower()
+    assert "now: Switch# (enable)" in out
+
+
+def test_confirmation_confirmed_with_answer_only(manager, make_switch):
+    """answer='y' alone confirms the prompt the auto-matcher detected."""
+    sw = _reboot_switch(make_switch)
+    _connect(manager, sw)
+    out = manager.execute_command(HOST, "reboot", answer="y", port=sw.port)
+    assert "System is rebooting" in out
+
+
+def test_confirmation_accepts_plain_literal_pattern(manager, make_switch):
+    """A literal '(y/n)' pattern (valid JSON, no backslashes) is honored too."""
+    sw = _reboot_switch(make_switch)
+    _connect(manager, sw)
+    out = manager.execute_command(HOST, "reboot", expect_regex="(y/n)", answer="y",
+                                  port=sw.port)
+    assert "System is rebooting" in out
+
+
 # ------------------------------------------------------------ session state
 
 def test_session_termination_is_reported(manager, make_switch):

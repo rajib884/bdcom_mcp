@@ -109,6 +109,7 @@ class SwitchEmulator:
         self,
         *,
         responses: Optional[dict[Union[str, Pattern[str]], Responder]] = None,
+        confirmations: Optional[dict[str, dict[str, Any]]] = None,
         hostname: str = "Switch",
         dialect: str = "bdcom",
         username: Optional[str] = "admin",
@@ -120,6 +121,10 @@ class SwitchEmulator:
         if dialect not in ("bdcom", "cisco"):
             raise ValueError("dialect must be 'bdcom' or 'cisco'")
         self.responses = responses or {}
+        # Interactive confirmations: command -> {"prompt": "...(y/n)?",
+        # "answers": {"y": "Rebooting...", "n": "Aborted."}}. The command emits the
+        # prompt and waits for a line; the matching answer's text is then returned.
+        self.confirmations = confirmations or {}
         self.hostname = hostname
         self.dialect = dialect
         self.username = username
@@ -220,6 +225,7 @@ class _Session:
         # Pending login state: None once authenticated / when no auth is required.
         self.await_field: Optional[str] = None  # "username" | "password" | None
         self.await_enable = False   # next line is the enable secret
+        self.await_confirm: Optional[dict] = None  # active interactive confirmation
         self._pending_user = ""
         self._lf_pending = False    # saw a CR; swallow a following LF (CRLF = one line)
         self._outbuf: list[str] = []  # output batched until the next flush
@@ -340,6 +346,9 @@ class _Session:
         line, self.line = self.line, ""
         if self.echo:
             self.send(_CRLF)
+        if self.await_confirm is not None:
+            self._handle_confirm(line.strip())
+            return
         if self.await_enable:
             self._handle_enable_secret(line)
             return
@@ -419,6 +428,13 @@ class _Session:
                 self.send(self.prompt())
             return
 
+        # Interactive confirmation: emit the prompt and wait for an answer line.
+        if cmd in self.emu.confirmations:
+            entry = self.emu.confirmations[cmd]
+            self.await_confirm = entry
+            self.send(entry.get("prompt", "Are you sure? (y/n)"))
+            return
+
         # Ordinary show/exec command -----------------------------------------
         output = self.emu.lookup(cmd)
         if output is None:
@@ -444,6 +460,15 @@ class _Session:
             self.send(self.prompt())
         else:
             self.send("% Bad secrets" + _CRLF + self.prompt())
+
+    def _handle_confirm(self, line: str) -> None:
+        """Resolve an interactive confirmation: emit the answer's text, redraw prompt."""
+        entry = self.await_confirm or {}
+        self.await_confirm = None
+        answers = entry.get("answers", {})
+        out = answers.get(line.strip().lower(), entry.get("default", ""))
+        body = (out + "\n").replace("\n", _CRLF) if out else ""
+        self.send(body + self.prompt())
 
     def _is_config_cmd(self, low: str) -> bool:
         if self.emu.dialect == "cisco":

@@ -121,13 +121,19 @@ def execute_command(
     ] = "auto",
     expect_regex: Annotated[
         Optional[str],
-        Field(description="Regex to expect for an interactive confirmation, e.g. "
-              "'[y/n]' or '\\(y/n\\)'. Honored only when a single command is given."),
+        Field(description="Usually NOT needed. To answer an interactive confirmation, "
+              "set `answer` alone — a standard '(y/n)' / '[yes/no]' / '[confirm]' "
+              "prompt is detected automatically. Only set this for a non-standard "
+              "prompt, and pass a PLAIN substring such as '(y/n)' or 'overwrite' — do "
+              "not add regex backslash escapes (a single backslash like '\\(' is "
+              "invalid JSON and will be rejected). Single command only."),
     ] = None,
     answer: Annotated[
         Optional[str],
-        Field(description="Answer to send when expect_regex matches (pair with "
-              "expect_regex; single command)."),
+        Field(description="Reply to send to an interactive confirmation prompt, e.g. "
+              "'y' or 'n'. Setting this alone is enough to answer a standard y/n / "
+              "[confirm] prompt — you normally do not also need expect_regex. Single "
+              "command only."),
     ] = None,
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:
@@ -137,8 +143,10 @@ def execute_command(
     command's raw output followed by a ``[device-mcp]`` footer reporting any device
     error (vs a transport failure) and where the CLI ended up (prompt + mode). With
     ``mode="config"`` the whole list is applied atomically and a rejected line is
-    reported without leaving a partial config. To reboot from the ``monitor#`` shell,
-    pass ``mode="raw"`` with ``expect_regex="\\(y/n\\)"`` and ``answer="y"``.
+    reported without leaving a partial config. To answer a confirmation prompt just set
+    ``answer`` (e.g. ``answer="n"`` to decline a reboot's ``(y/n)``, or ``answer="y"``
+    to confirm) — the standard prompt is detected automatically, so no ``expect_regex``
+    is needed. To reboot from the ``monitor#`` shell, add ``mode="raw"``.
     """
     try:
         return _manager.run_commands(
