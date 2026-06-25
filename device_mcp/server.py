@@ -121,19 +121,17 @@ def execute_command(
     ] = "auto",
     expect_regex: Annotated[
         Optional[str],
-        Field(description="Usually NOT needed. To answer an interactive confirmation, "
-              "set `answer` alone — a standard '(y/n)' / '[yes/no]' / '[confirm]' "
-              "prompt is detected automatically. Only set this for a non-standard "
-              "prompt, and pass a PLAIN substring such as '(y/n)' or 'overwrite' — do "
-              "not add regex backslash escapes (a single backslash like '\\(' is "
-              "invalid JSON and will be rejected). Single command only."),
+        Field(description="Pattern marking an interactive confirmation prompt, paired "
+              "with `answer`. Pass a PLAIN substring such as '(y/n)' or '[confirm]' — "
+              "do NOT add regex backslash escapes: write '(y/n)', not the "
+              "backslash-escaped form, which is invalid JSON and gets rejected. "
+              "Matched as a substring, so the bare parens are fine. Single command "
+              "only."),
     ] = None,
     answer: Annotated[
         Optional[str],
-        Field(description="Reply to send to an interactive confirmation prompt, e.g. "
-              "'y' or 'n'. Setting this alone is enough to answer a standard y/n / "
-              "[confirm] prompt — you normally do not also need expect_regex. Single "
-              "command only."),
+        Field(description="Reply to send when expect_regex matches, e.g. 'y' or 'n'. "
+              "Pair with expect_regex; single command only."),
     ] = None,
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:
@@ -143,10 +141,10 @@ def execute_command(
     command's raw output followed by a ``[device-mcp]`` footer reporting any device
     error (vs a transport failure) and where the CLI ended up (prompt + mode). With
     ``mode="config"`` the whole list is applied atomically and a rejected line is
-    reported without leaving a partial config. To answer a confirmation prompt just set
-    ``answer`` (e.g. ``answer="n"`` to decline a reboot's ``(y/n)``, or ``answer="y"``
-    to confirm) — the standard prompt is detected automatically, so no ``expect_regex``
-    is needed. To reboot from the ``monitor#`` shell, add ``mode="raw"``.
+    reported without leaving a partial config. To answer a confirmation prompt, pair
+    ``expect_regex`` with ``answer`` — e.g. ``expect_regex="(y/n)"`` (plain parens, no
+    backslashes) with ``answer="n"`` to decline a reboot or ``answer="y"`` to confirm.
+    To reboot from the ``monitor#`` shell, add ``mode="raw"``.
     """
     try:
         return _manager.run_commands(

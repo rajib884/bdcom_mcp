@@ -186,35 +186,21 @@ def _reboot_switch(make_switch):
     }})
 
 
-def test_confirmation_declined_with_answer_only(manager, make_switch):
-    """answer='n' alone declines a (y/n) prompt - no expect_regex needed.
+def test_confirmation_with_plain_pattern_declines(manager, make_switch):
+    """Decline a reboot's (y/n) over the real interactive path.
 
-    This is the scenario that previously forced an invalid-JSON regex (``\\(y/n\\)``):
-    now the standard prompt is auto-detected from the answer.
+    The pattern is the plain substring '(y/n)' — valid JSON with no backslash escapes
+    (the escaped form '\\(y/n\\)' is invalid JSON and is what tripped callers up). It is
+    matched as a substring against the device's "...(y/n)?", and the answer 'n' is then
+    sent and its aftermath captured.
     """
     sw = _reboot_switch(make_switch)
     _connect(manager, sw)
-    out = manager.execute_command(HOST, "reboot", answer="n", port=sw.port)
+    out = manager.execute_command(HOST, "reboot", expect_regex="(y/n)", answer="n",
+                                  port=sw.port)
     assert "Reboot canceled" in out
     assert "rebooting" not in out.lower()
     assert "now: Switch# (enable)" in out
-
-
-def test_confirmation_confirmed_with_answer_only(manager, make_switch):
-    """answer='y' alone confirms the prompt the auto-matcher detected."""
-    sw = _reboot_switch(make_switch)
-    _connect(manager, sw)
-    out = manager.execute_command(HOST, "reboot", answer="y", port=sw.port)
-    assert "System is rebooting" in out
-
-
-def test_confirmation_accepts_plain_literal_pattern(manager, make_switch):
-    """A literal '(y/n)' pattern (valid JSON, no backslashes) is honored too."""
-    sw = _reboot_switch(make_switch)
-    _connect(manager, sw)
-    out = manager.execute_command(HOST, "reboot", expect_regex="(y/n)", answer="y",
-                                  port=sw.port)
-    assert "System is rebooting" in out
 
 
 # ------------------------------------------------------------ session state
