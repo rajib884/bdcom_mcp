@@ -312,28 +312,28 @@ def get_help(
 #         return f"Error: {exc}"
 
 
-# @mcp.tool
-# def enter_monitor_mode(
-#     host: Annotated[
-#         str, Field(description="IP address or hostname of the connected device")
-#     ],
-#     timeout: Annotated[
-#         float,
-#         Field(description="Max seconds to reach the monitor prompt (default 180)"),
-#     ] = 180.0,
-#     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
-# ) -> str:
-#     """Drop the device into the bootloader ``monitor#`` shell.
+@mcp.tool
+def enter_monitor_mode(
+    host: Annotated[
+        str, Field(description="IP address or hostname of the connected device")
+    ],
+    timeout: Annotated[
+        float,
+        Field(description="Max seconds to reach the monitor prompt (default 180)"),
+    ] = 180.0,
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+) -> str:
+    """Drop the device into the bootloader ``monitor#`` shell.
 
-#     Two stages: (1) initiate a reboot — tries the hidden ``menu:`` reboot option
-#     first (works even at a login prompt), falling back to ``reboot``+``y``; (2) after
-#     ``RTC Test``, sends a short Ctrl-P burst to interrupt the boot into monitor mode.
-#     Returns the boot transcript plus a footer (``now: monitor#`` on success).
-#     """
-#     try:
-#         return _manager.enter_monitor_mode(host, timeout=timeout, port=port)
-#     except Exception as exc:  # noqa: BLE001
-#         return f"Error: {exc}"
+    Two stages: (1) initiate a reboot — tries the hidden ``menu:`` reboot option
+    first (works even at a login prompt), falling back to ``reboot``+``y``; (2) after
+    ``RTC Test``, sends a short Ctrl-P burst to interrupt the boot into monitor mode.
+    Returns the boot transcript plus a footer (``now: monitor#`` on success).
+    """
+    try:
+        return _manager.enter_monitor_mode(host, timeout=timeout, port=port)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error: {exc}"
 
 
 # @mcp.tool
