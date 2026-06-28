@@ -26,6 +26,12 @@ dependencies = [
     "netmiko>=4.3.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2",
+]
+
 [project.scripts]
 device-mcp = "device_mcp.server:main"
 
@@ -39,3 +45,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["device_mcp"]
+
+[tool.pytest.ini_options]
+# The emulator-backed integration tests live in tests/; the standalone
+# smoke_test.py is run separately (python smoke_test.py).
+testpaths = ["tests"]
+# Each test drives a real netmiko telnet login (~9s); bound a genuine hang so it
+# fails one test fast instead of stalling the whole run. Requires pytest-timeout.
+timeout = 30

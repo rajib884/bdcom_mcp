@@ -58,18 +58,39 @@ device_mcp/
 
 ## 🧪 Testing
 
-### Manual Testing
-1. Run the offline smoke test: `python smoke_test.py`
-2. Test with a real device (Cisco IOS, BDCOM, etc.) or simulator
-3. Verify all connection types (SSH/Telnet)
-4. Test different command modes (user/enable/config)
+There are two complementary test suites:
+
+### 1. Offline smoke test (pure logic, fakes)
+Exercises the parsers, formatters, and the manager's bookkeeping with hand-written
+fakes — no sockets, runs in well under a second:
+```bash
+python smoke_test.py
+```
+
+### 2. Emulator integration tests (real Telnet path)
+`tests/` drives the *real* `DeviceConnectionManager` and netmiko drivers against an
+in-process Telnet switch emulator (`tests/switch_emulator.py`), so login,
+`session_preparation`, enable/config-mode transitions, paging, and `?` help are all
+exercised over an actual socket. A test pins device output via the emulator's
+`responses` map and asserts on what the manager returns.
+```bash
+pip install -e ".[dev]"   # installs pytest
+pytest
+```
+The emulator is scriptable — `SwitchEmulator(responses={"show version": "..."})` —
+and supports both the `bdcom` and `cisco` CLI dialects. See
+`tests/test_emulator_integration.py` for examples when adding coverage for a new
+command or behavior.
 
 ### Test Scenarios
 - Connection establishment and teardown
 - Command execution in different modes
 - Error handling for invalid commands
 - Multi-device connection management
-- Network timeout scenarios
+- Network timeout / session-termination scenarios
+
+Run both suites before opening a PR. Testing against real hardware (Cisco IOS,
+BDCOM) is still encouraged for changes to the connection or driver layer.
 
 ## 📝 Documentation
 

@@ -110,11 +110,11 @@ def execute_command(
         ),
     ],
     mode: Annotated[
-        Literal["auto", "user", "enable", "config", "raw"],
+        Literal["raw", "user", "enable", "config", "auto"],
         Field(
-            description="auto (default) runs at the current privilege level without "
+            description="auto runs at the current privilege level without "
             "downgrading; user/enable/config force that level (config applies the "
-            "list as one atomic block); raw drives the channel directly (where a "
+            "list as one atomic block); raw (default) drives the channel directly (where a "
             "normal command would wait for the device's usual 'Switch.*' prompt and "
             "never be sent)."
         ),
@@ -126,8 +126,8 @@ def execute_command(
     ] = None,
     answer: Annotated[
         Optional[str],
-        Field(description="Answer to send when expect_regex matches (pair with "
-              "expect_regex; single command)."),
+        Field(description="Answer to send when expect_regex matches, e.g. 'y' or 'n'. "
+              "single command mode only."),
     ] = None,
     port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
 ) -> str:

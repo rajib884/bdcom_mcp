@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 import netmiko
-from netmiko import ConnectHandler
+from netmiko import ConnectHandler, BaseConnection
 from netmiko.exceptions import (
     ConfigInvalidException,
     NetmikoAuthenticationException,
@@ -59,6 +59,9 @@ SessionState = Literal[
 # outputs such as ``show running-config`` / ``show tech-support`` complete.
 _EXEC_READ_TIMEOUT = 60.0
 _CONFIG_READ_TIMEOUT = 60.0
+# Idle window: how long the raw confirmation-answer reader waits after the device
+# falls silent before returning (its aftermath may never re-show a prompt).
+_CONFIRM_IDLE = 2.0
 
 # Hard ceiling for read_console_stream so a tool call cannot block forever.
 _MAX_STREAM_TIMEOUT = 120.0
@@ -474,14 +477,12 @@ def _footer(
     else:
         where = f"now: {state}"
     if terminated:
-        head = (
-            "SESSION_TERMINATED: device returned to login prompt — reconnect required"
-        )
+        head = "device returned to login prompt"
     elif failure:
         head = f"FAILED: {failure}"
     elif device_error:
         near = device_error.get("near")
-        head = "device error: " + device_error["message"]
+        head = "ERROR: " + device_error["message"]
         if near:
             head += f" near '{near}'"
     elif note:
@@ -635,10 +636,7 @@ class DeviceConnectionManager:
             if existing is not None and existing.connected:
                 return {
                     "success": True,
-                    "message": f"Already connected to {target} via {protocol.upper()}",
-                    "host": host,
-                    "port": resolved_port,
-                    "target": target,
+                    "message": f"Already connected to {target} ({existing.config['device_type']}) via {protocol.upper()}",
                 }
 
             try:
@@ -730,10 +728,6 @@ class DeviceConnectionManager:
                     f"Successfully connected to {target} ({device_type}) "
                     f"via {protocol.upper()}"
                 ),
-                "host": host,
-                "port": resolved_port,
-                "target": target,
-                "log_file": log_path,
             }
 
     def _start_idle_logger(self, target: str, conn: DeviceConnection) -> None:
@@ -786,7 +780,7 @@ class DeviceConnectionManager:
         self,
         host: str,
         commands: list[str],
-        mode: Mode = "auto",
+        mode: Mode = "raw",
         expect_regex: str | None = None,
         answer: str | None = None,
         port: int | None = None,
@@ -815,13 +809,13 @@ class DeviceConnectionManager:
             )
             for cmd in commands
         ]
-        return "\n\n".join(results)
+        return "\n".join(results)
 
     def execute_command(
         self,
         host: str,
         command: str,
-        mode: Mode = "auto",
+        mode: Mode = "raw",
         expect_regex: str | None = None,
         answer: str | None = None,
         port: int | None = None,
@@ -910,35 +904,148 @@ class DeviceConnectionManager:
         expect_regex: str | None,
         answer: str | None,
     ) -> str:
-        """Send ``command`` with raw channel I/O - no mode switching, no reliance on
-        netmiko's cached prompt. Caller holds the lock. Used for the ``monitor#`` shell
-        (and any prompt netmiko can't match), e.g. the final reboot after a recovery
-        flash."""
-        net = conn.connection
+        """Send ``command`` with raw channel I/O, but strip the command echo and
+        trailing prompt like ``send_command`` does.  If the prompt (``expect_regex``)
+        is not found within the timeout, the collected output is returned **without**
+        raising ReadTimeout.
+        """
+        net: BaseConnection = conn.connection
         try:
+            # Drain any stale residue
             try:
-                net.read_channel()  # drain residue
-            except Exception:  # noqa: BLE001
+                net.read_channel()
+            except Exception:
                 pass
-            pat = re.compile(expect_regex) if expect_regex else None
-            output = _send_and_read(net, command, pat, timeout=_EXEC_READ_TIMEOUT, idle=2.0)
+
+            output = ""
+            prompt = None
+            prepend = ""
+
+            # Determine the stop pattern – use the caller’s regex, or fall back.
+            try:
+                prompt = net.find_prompt()
+                prepend += prompt
+            except ValueError:
+                if net.base_prompt:
+                    prompt = net.base_prompt
+
+            if prompt is None or command.strip() in ("exit", "config", "\x1a"):
+                # Ultimate fallback: a generic CLI prompt ( > or # )
+                pattern = r"([Uu]sername:|[Pp]assword:|[>#])\s*$"
+            else:
+                pattern = re.escape(prompt)
+
+            if expect_regex:
+                search_pattern = re.compile(expect_regex)
+            else:
+                search_pattern = re.compile(pattern)
+
+            # 1 ─── send the command ─────────────
+            net.write_channel(net.normalize_cmd(command))
+
+            # 2 ─── read until the prompt (pattern) or until _EXEC_READ_TIMEOUT
+            start = time.time()
+            while time.time() - start < _EXEC_READ_TIMEOUT:
+                chunk = net.read_channel()
+                if chunk:
+                    output += chunk
+                    if search_pattern.search(output):
+                        break
+                time.sleep(0.05)
+
+            output = prepend + output
+
+            # If the loop finishes without finding the pattern, we just keep what we have.
+
+            # 3 ─── sanitise (strip command echo and trailing prompt) ──
+            output = net._sanitize_output(
+                output,
+                strip_command=False,
+                command_string=command,
+                strip_prompt=False,
+            )
+
+            # 4 ─── optional confirmation answer ───────────────────────
             if expect_regex and answer is not None:
-                # Answer the confirmation, then drain the aftermath (e.g. the reboot
-                # banner) - the device may not return a clean prompt.
-                output += "\n" + _send_and_read(net, answer, None, timeout=8.0, idle=1.5)
-        except Exception as exc:  # noqa: BLE001
+                net.write_channel(answer + net.RETURN)
+                search_pattern = re.compile(pattern)
+                answer_output = ""
+                start = time.time()
+                last_data = start
+                while time.time() - start < _EXEC_READ_TIMEOUT:
+                    chunk = net.read_channel()
+                    if chunk:
+                        answer_output += chunk
+                        last_data = time.time()
+                        if search_pattern.search(answer_output):
+                            break
+                    # A confirmation's aftermath (e.g. a reboot banner) often never
+                    # returns a clean prompt; once the device falls silent, stop instead
+                    # of blocking for the full read timeout.
+                    elif answer_output and time.time() - last_data > _CONFIRM_IDLE:
+                        break
+                    time.sleep(0.05)
+                answer_output = net._sanitize_output(
+                    answer_output,
+                    strip_command=False,
+                    strip_prompt=False,
+                )
+                output += "\n" + answer_output
+
+        except Exception as exc:
             prompt, state = _describe_session(net, conn.console)
-            return _footer(failure=f"{type(exc).__name__}: {exc}",
-                           prompt=prompt, state=state, hint=_dialect_hint(command))
+            # A command that drops the CLI back to login (e.g. 'write memory' on BDCOM)
+            # often surfaces as an EOFError here; report it as a terminated session, not
+            # a generic transport failure, so the caller knows to reconnect.
+            if state in ("awaiting_login", "session_terminated"):
+                return (
+                    output.rstrip("\n")
+                    + "\n\n"
+                    + _footer(
+                        terminated=True,
+                        prompt=prompt,
+                        state=state,
+                        hint=_dialect_hint(command),
+                    )
+                )
+            return (
+                output.rstrip("\n")
+                + "\n\n"
+                + _footer(
+                    failure=f"{type(exc).__name__}: {exc}",
+                    prompt=prompt,
+                    state=state,
+                    hint=_dialect_hint(command),
+                )
+            )
+
+        # Determine session state after the command
         prompt, state = _describe_session(net, conn.console)
-        conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
+        conn.current_mode = (
+            state if state in ("user", "enable", "config") else conn.current_mode
+        )
+
         if state in ("awaiting_login", "session_terminated"):
-            return output.rstrip("\n") + "\n\n" + _footer(
-                terminated=True, prompt=prompt, state=state, hint=_dialect_hint(command))
+            return (
+                output.rstrip("\n")
+                + "\n\n"
+                + _footer(
+                    terminated=True,
+                    prompt=prompt,
+                    state=state,
+                    hint=_dialect_hint(command),
+                )
+            )
+
+        # Raw mode keeps output lean: the trailing prompt is already in `output`, so a
+        # success footer would just be redundant tokens. Only annotate a genuine problem.
         device_error = _detect_device_error(output)
-        return output.rstrip("\n") + "\n\n" + _footer(
-            device_error=device_error, prompt=prompt, state=state,
-            hint=_dialect_hint(command) if device_error else None)
+        if device_error:
+            return output.rstrip("\n") + "\n\n" + _footer(
+                device_error=device_error, prompt=prompt, state=state,
+                hint=_dialect_hint(command),
+            )
+        return output.rstrip("\n")
 
     # ------------------------------------------------------------------ configure
     def configure(
@@ -1459,9 +1566,6 @@ class DeviceConnectionManager:
             return {
                 "success": True,
                 "message": f"Successfully disconnected from {key}",
-                "host": host,
-                "port": conn.config.get("port"),
-                "target": key,
                 "log_file": conn.log_path,
             }
 
@@ -1543,4 +1647,7 @@ class DeviceConnectionManager:
 
     @staticmethod
     def _failure(host: str, message: str, port: int | None = None) -> dict[str, Any]:
-        return {"success": False, "message": message, "host": host, "port": port}
+        return {
+            "success": False,
+            "message": message,
+        }

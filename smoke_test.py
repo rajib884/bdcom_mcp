@@ -34,6 +34,7 @@ EXPECTED_TOOLS = {
     "get_console_history",
     "read_console_stream",
     "get_help",
+    "enter_monitor_mode",
 }
 
 
@@ -261,19 +262,21 @@ def check_execute_footer() -> None:
 
     caret = " " * 15 + "^"
     err = f"show interface status\n{caret}\nUnknown command"
+    # These exercise the non-raw (send_command) footer path, so request it explicitly
+    # now that "raw" is the default mode.
     _attach(mgr, "h:23", _FakeNet(output=err, prompt="Switch#"))
-    res = mgr.execute_command("h", "show interface status", port=23)
+    res = mgr.execute_command("h", "show interface status", mode="auto", port=23)
     assert "Unknown command" in res                      # raw output preserved
-    assert "[device-mcp] device error: Unknown command near 'status'" in res, res
+    assert "[device-mcp] ERROR: Unknown command near 'status'" in res, res
     assert "now: Switch# (enable)" in res, res
 
     _attach(mgr, "h:24", _FakeNet(output="...Version 2.2.0F", prompt="Switch#"))
-    ok = mgr.execute_command("h", "show version", port=24)
+    ok = mgr.execute_command("h", "show version", mode="auto", port=24)
     assert ok.rstrip().endswith("[device-mcp] ok | now: Switch# (enable)"), ok
 
     _attach(mgr, "h:25", _FakeNet(send_raise=RuntimeError("Pattern not detected"),
                                   prompt="Switch#"))
-    fail = mgr.execute_command("h", "show running-config", port=25)
+    fail = mgr.execute_command("h", "show running-config", mode="auto", port=25)
     assert "[device-mcp] FAILED:" in fail and "Pattern not detected" in fail, fail
     print("execute_command footer: OK")
 
@@ -418,6 +421,13 @@ class _FakeMonitor:
     def find_prompt(self) -> str:
         return "monitor#"
 
+    # Channel helpers the raw path calls (netmiko provides these on a real driver).
+    def normalize_cmd(self, command: str) -> str:
+        return command + self.RETURN
+
+    def _sanitize_output(self, output: str, **kw) -> str:
+        return output
+
     def _stale_prompt(self, *a, **k):
         raise RuntimeError("ReadTimeout: Pattern not detected: 'Switch.*'")
 
@@ -527,12 +537,12 @@ def check_session_terminated() -> None:
     mgr = DeviceConnectionManager()
     _attach(mgr, "h:23", _FakeLoginNet())
     res = mgr.execute_command("h", "show version", port=23)
-    assert "SESSION_TERMINATED" in res, res
+    assert "device returned to login prompt" in res, res
     assert "now: awaiting_login" in res, res          # no raw "Username:" leak
     # write memory dropped us to login: the footer should still carry the hint.
     _attach(mgr, "h:24", _FakeLoginNet())
     res2 = mgr.execute_command("h", "write memory", port=24)
-    assert "SESSION_TERMINATED" in res2 and "hint:" in res2, res2
+    assert "device returned to login prompt" in res2 and "hint:" in res2, res2
     print("session terminated reporting: OK")
 
 
@@ -569,7 +579,7 @@ def check_execute_raw_monitor() -> None:
     """At monitor#, the normal path fails (stale 'Switch.*' prompt); raw works."""
     mgr = DeviceConnectionManager()
     _attach(mgr, "h:23", _FakeMonitor())
-    nonraw = mgr.execute_command("h", "reboot", expect_regex=r"\(y/n\)",
+    nonraw = mgr.execute_command("h", "reboot", mode="auto", expect_regex=r"\(y/n\)",
                                  answer="y", port=23)
     assert "FAILED" in nonraw, nonraw          # demonstrates the stuck-prompt bug
 
@@ -577,7 +587,8 @@ def check_execute_raw_monitor() -> None:
     raw = mgr.execute_command("h", "reboot", mode="raw", expect_regex=r"\(y/n\)",
                               answer="y", port=24)
     assert "Please wait" in raw, raw           # the reboot actually ran
-    assert "now: monitor#" in raw, raw
+    # raw success is lean (no footer); the monitor prompt is embedded in the output.
+    assert "monitor#" in raw, raw
     print("execute_command raw (monitor): OK")
 
 
@@ -593,9 +604,10 @@ def check_run_commands() -> None:
     assert "applied 2 command(s)" in res, res
 
     # exec mode -> each command runs sequentially, each with its own footer.
+    # (Request mode="auto" explicitly: "raw" is the default and emits no success footer.)
     net2 = _FakeNet(output="...ok", prompt="Switch#")
     _attach(mgr, "h:24", net2)
-    res2 = mgr.run_commands("h", ["show version", "show clock"], port=24)
+    res2 = mgr.run_commands("h", ["show version", "show clock"], mode="auto", port=24)
     assert net2.sent == ["show version", "show clock"], net2.sent
     assert res2.count("[device-mcp]") == 2, res2
 
@@ -681,7 +693,7 @@ def check_idle_logger_preserves_tools() -> None:
     history = mgr.get_console_history("h", port=23)
     assert "LINK-3-UPDOWN" in history, history
 
-    result = mgr.execute_command("h", "show version", port=23)
+    result = mgr.execute_command("h", "show version", mode="auto", port=23)
     assert "BDCOM Software Version" in result, result
     assert net.sent == ["show version"], net.sent
     assert "LINK-3-UPDOWN" in mgr.get_console_history("h", port=23)
