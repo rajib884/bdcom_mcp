@@ -29,6 +29,7 @@ from device_mcp.server import mcp
 EXPECTED_TOOLS = {
     "connect_device",
     "execute_command",
+    "relogin_device",
     "disconnect_device",
     "list_connections",
     "get_console_history",

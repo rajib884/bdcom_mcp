@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import time
+import types
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -597,7 +598,9 @@ class DeviceConnection:
     connected: bool = True
     connected_at: datetime = field(default_factory=_now)
     last_activity: datetime = field(default_factory=_now)
-    current_mode: Mode = "user"
+    # Tracks the CLI level; "unknown" until established (e.g. a recovery connect
+    # that skipped prompt detection, or before the first command).
+    current_mode: Mode | Literal["unknown"] = "user"
     log_path: Optional[str] = None
     idle_log_stop: threading.Event | None = None
     idle_log_thread: threading.Thread | None = None
@@ -627,6 +630,8 @@ class DeviceConnectionManager:
         port: int | None = None,
         enable_password: str | None = None,
         auto_bypass_wizard: bool = True,
+        recovery: bool = False,
+        auto_relogin: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
             resolved_port = port if port is not None else _DEFAULT_PORTS.get(protocol, 22)
@@ -661,6 +666,11 @@ class DeviceConnectionManager:
                 # only writes this drops from the audit log are non-echoed ones -
                 # credentials (already masked) and raw control bytes (Ctrl-Z/Ctrl-P).
                 "session_log_record_writes": False,
+                # Recovery mode opens the transport ourselves (below) so we can skip
+                # login + session_preparation on a device too broken to present a
+                # usable prompt; auto_connect=False keeps netmiko's __init__ from
+                # doing it (and failing) first.
+                "auto_connect": not recovery,
             }
             # username/password are optional: unsecured console/terminal-server
             # ports may need neither. Only pass what was supplied.
@@ -683,6 +693,26 @@ class DeviceConnectionManager:
                     connection = dispatch(device_type=class_device_type, **params)
                 else:
                     connection = ConnectHandler(device_type=dispatch, **params)
+                if recovery:
+                    # auto_connect=False left the transport closed. Open just the
+                    # socket+channel and deliberately skip both login and
+                    # session_preparation so a device stuck below a usable prompt
+                    # (no login, no '#'/'>') is still reachable for raw I/O - e.g.
+                    # enter_monitor_mode's Ctrl-]/Ctrl-P force-reboot, or
+                    # execute_command(mode="raw"). For telnet, establish_connection
+                    # wires up the channel before calling telnet_login, so
+                    # neutralizing telnet_login leaves a fully usable raw channel
+                    # with no credentials needed. (SSH still authenticates via
+                    # paramiko - it cannot open a channel otherwise.)
+                    connection._modify_connection_params()
+                    if protocol == "telnet":
+                        connection.telnet_login = types.MethodType(
+                            lambda self, *a, **k: "", connection
+                        )
+                    connection.establish_connection()
+                    # No prompt was detected; the raw path falls back to a generic
+                    # [>#] pattern when base_prompt is empty.
+                    connection.base_prompt = ""
             except NetmikoAuthenticationException as exc:
                 # Surface what the device actually sent (the login banner/prompts) so
                 # the caller can tell a bad password from a banner-only or
@@ -704,7 +734,7 @@ class DeviceConnectionManager:
                 console.close()
                 return self._failure(host, f"{type(exc).__name__}: {exc}", port=resolved_port)
 
-            if auto_bypass_wizard:
+            if auto_bypass_wizard and not recovery:
                 self._maybe_bypass_wizard(connection)
 
             managed = DeviceConnection(
@@ -713,12 +743,22 @@ class DeviceConnectionManager:
                     "port": resolved_port,
                     "device_type": device_type,
                     "protocol": protocol,
+                    # username/password are kept in memory (the audit log masks
+                    # credentials) so relogin can re-auth on the live channel after
+                    # an idle-timeout drop without a full reconnect.
+                    "username": username,
+                    "password": password,
                     "enable_password": enable_password,
+                    "auto_relogin": auto_relogin,
+                    "recovery": recovery,
                 },
                 connection=connection,
                 console=console,
                 connected_at=opened,
                 log_path=log_path,
+                # A recovery connect skipped prompt detection; the CLI level is
+                # unknown until the caller drives it (raw I/O / monitor mode).
+                current_mode="unknown" if recovery else "user",
             )
             self._connections[target] = managed
             self._start_idle_logger(target, managed)
@@ -774,6 +814,87 @@ class DeviceConnectionManager:
                     conn.last_activity = _now()
             finally:
                 self._lock.release()
+
+    # ------------------------------------------------------------------ relogin
+    def relogin(
+        self,
+        host: str,
+        username: str | None = None,
+        password: str | None = None,
+        port: int | None = None,
+    ) -> str:
+        """Re-authenticate on the existing channel after an idle-timeout drop.
+
+        When a device times out and drops back to its ``Username:`` prompt, the socket
+        is still open - only the CLI logged out. This re-sends credentials on the live
+        channel instead of tearing the connection down and rebuilding it. Credentials
+        default to the ones supplied at connect (kept in memory); pass them explicitly
+        for a recovery connection that was opened without any. Returns a
+        ``[device-mcp]`` footer reporting where the CLI ended up.
+        """
+        with self._lock:
+            conn = self._connections[self._resolve(host, port)]
+            if not conn.connected:
+                raise RuntimeError(
+                    f"No active connection to {host}. Please connect first."
+                )
+            return self._relogin(conn, username, password)
+
+    def _relogin(
+        self,
+        conn: DeviceConnection,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> str:
+        """Drive username/password on the live channel. Caller holds the lock."""
+        net = conn.connection
+        conn.last_activity = _now()
+        user = username if username is not None else conn.config.get("username")
+        pwd = password if password is not None else conn.config.get("password")
+        out = ""
+        try:
+            try:
+                net.read_channel()  # drain residue before re-authenticating
+            except Exception:  # noqa: BLE001
+                pass
+            # Send the username and wait for the password prompt; then the password
+            # and wait for a CLI prompt (success) or an auth-failure line.
+            if user is not None:
+                out += _send_and_read(net, user, _LOGIN_PROMPT_RE, timeout=15.0, idle=1.0)
+            if pwd is not None:
+                out += _send_and_read(
+                    net, pwd, re.compile(r"[>#]\s*$|Authentication failed"),
+                    timeout=15.0, idle=1.0,
+                )
+            else:
+                out += _read_until(net, _CLI_PROMPT_RE, timeout=10.0, idle=1.0)
+            # Re-establish base prompt / enable / paging exactly as on first connect,
+            # using the driver's own session_preparation so per-platform behavior
+            # matches. We just consumed the post-login prompt, so prime the channel
+            # with a RETURN first - otherwise session_preparation's initial channel
+            # read finds no data and raises before it can elevate.
+            try:
+                net.write_channel(getattr(net, "RETURN", "\n"))
+                time.sleep(0.3)
+                net.session_preparation()
+            except Exception:  # noqa: BLE001 - best effort, mirrors connect()
+                pass
+        except Exception as exc:  # noqa: BLE001
+            prompt, state = _describe_session(net, conn.console)
+            return out.rstrip("\n") + "\n\n" + _footer(
+                failure=f"{type(exc).__name__}: {exc}", prompt=prompt, state=state
+            )
+
+        prompt, state = _describe_session(net, conn.console)
+        conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
+        if state in ("awaiting_login", "session_terminated"):
+            return out.rstrip("\n") + "\n\n" + _footer(
+                failure="re-login failed (still at login prompt)",
+                prompt=prompt, state=state,
+            )
+        return out.rstrip("\n") + "\n\n" + _footer(
+            note="re-logged in", prompt=prompt, state=state
+        )
 
     # ------------------------------------------------------------------ execute
     def run_commands(
@@ -842,6 +963,13 @@ class DeviceConnectionManager:
 
             net = conn.connection
             conn.last_activity = _now()
+            # Opt-in: if the device idle-timed out back to its login prompt, re-auth
+            # once on the live channel before running the command (single bounded
+            # attempt so a flapping device can't trigger a credential-spray loop).
+            if conn.config.get("auto_relogin"):
+                _, pre_state = _describe_session(net, conn.console)
+                if pre_state in ("awaiting_login", "session_terminated"):
+                    self._relogin(conn)
             if mode == "raw":
                 return self._execute_raw(conn, command, expect_regex, answer)
             try:

@@ -226,6 +226,59 @@ def test_session_termination_is_reported(manager, make_switch):
     assert "now: awaiting_login" in out
 
 
+# ------------------------------------------------------- recovery / relogin
+
+def test_recovery_connect_skips_login_and_prep(manager, make_switch):
+    """recovery=True opens the transport without login or session_preparation.
+
+    The point is reachability when the device is too broken to present a usable prompt:
+    nothing is sent at connect (no enable / paging-disable), yet the raw channel is
+    immediately usable for command I/O (and, on real hardware, enter_monitor_mode).
+    """
+    sw = make_switch(username=None, password=None,
+                     responses={"show version": "BDCOM Software, Version 2.2.0F"})
+    res = manager.connect(host=HOST, device_type="bdcom", protocol="telnet",
+                          port=sw.port, recovery=True)
+    assert res["success"] is True, res
+    # session_preparation was skipped: it never elevated or disabled paging.
+    assert "enable" not in sw.commands_seen
+    assert "terminal length 0" not in sw.commands_seen
+    # The raw channel still works.
+    out = manager.execute_command(HOST, "show version", port=sw.port)
+    assert "Version 2.2.0F" in out
+
+
+def test_relogin_after_idle_drop(manager, make_switch):
+    """An idle-timeout drop to the login prompt is recovered without a reconnect."""
+    sw = make_switch(responses={"show clock": "12:00:00"})
+    _connect(manager, sw)
+    sw.drop_to_login = True  # next command lands back at the login prompt (socket open)
+    # Stop fast on the redrawn 'Username:' instead of waiting out the read timeout.
+    out = manager.execute_command(HOST, "show clock", expect_regex="Username:", port=sw.port)
+    assert "now: awaiting_login" in out
+    # Re-authenticate on the same socket; stored credentials are reused.
+    relog = manager.relogin(HOST, port=sw.port)
+    assert "re-logged in" in relog, relog
+    assert "now: Switch# (enable)" in relog
+    # The connection is usable again, no disconnect/reconnect needed.
+    again = manager.execute_command(HOST, "show clock", port=sw.port)
+    assert "12:00:00" in again
+
+
+def test_auto_relogin_recovers_transparently(manager, make_switch):
+    """With auto_relogin, a command issued after an idle drop re-auths and runs."""
+    sw = make_switch(responses={"show clock": "12:00:00"})
+    _connect(manager, sw, auto_relogin=True)
+    sw.drop_to_login = True
+    # First command trips the drop and lands at the login prompt.
+    first = manager.execute_command(HOST, "show clock", expect_regex="Username:", port=sw.port)
+    assert "now: awaiting_login" in first
+    # The next command finds the session at login, re-authenticates before sending,
+    # and returns real output - no explicit relogin call.
+    out = manager.execute_command(HOST, "show clock", port=sw.port)
+    assert "12:00:00" in out
+
+
 # ----------------------------------------------------------------- dialect
 
 def test_cisco_dialect_prompts_and_config(manager, make_switch):

@@ -198,8 +198,12 @@ class SwitchEmulator:
         self.banner = banner
         self._unknown = unknown_command_reply or _default_unknown_reply
         # Per-test toggles a test can flip mid-session: terminate forces every client
-        # back to the login prompt (a desynced session); paging emits a --More-- pager.
+        # back to the login prompt then drops the socket (a desynced session);
+        # drop_to_login models an idle timeout - it redraws the login prompt but keeps
+        # the socket open, so a relogin can re-auth on the live channel; paging emits a
+        # --More-- pager.
         self.terminate = False
+        self.drop_to_login = False
         self.paging = False
         # Commands every connected handler has seen, for assertions (thread-safe-ish:
         # tests use one client at a time).
@@ -553,6 +557,18 @@ class _Session:
             # 'Username:' in the console tail and reports the session as terminated.
             self.send(_CRLF + "Username: ")
             raise _Disconnect()
+        if self.emu.drop_to_login and cmd:
+            # Simulate an idle timeout: drop back to the login prompt but keep the
+            # socket open, so a relogin can re-authenticate on the live channel. Only
+            # a real (non-empty) command triggers it, so a bare prompt-probe newline
+            # (e.g. netmiko's find_prompt) doesn't silently consume the drop.
+            self.emu.drop_to_login = False
+            self.mode = "user"
+            self.submode = ""
+            self.await_field = "username"
+            self.echo = True
+            self.send(_CRLF + "Username: ")
+            return
         if cmd:
             self.emu._note_command(cmd)
 

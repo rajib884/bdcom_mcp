@@ -1,11 +1,13 @@
 """Device MCP Server (Python / FastMCP).
 
 A FastMCP server for managing network devices (Cisco IOS, BDCOM, and any other
-netmiko-supported platform) over SSH or Telnet. Exposes seven tools:
+netmiko-supported platform) over SSH or Telnet. Exposes these tools:
 
-    * connect_device
+    * connect_device       - connect (recovery=True opens the transport without login/
+                             prep for a broken device; auto_relogin re-auths on idle drop)
     * execute_command      - run one or more commands (mode=config = atomic block;
                              mode=raw = drive the channel directly, e.g. monitor#)
+    * relogin_device       - re-authenticate on the live channel after an idle-timeout drop
     * disconnect_device
     * list_connections
     * get_console_history
@@ -75,6 +77,24 @@ def connect_device(
         Optional[str],
         Field(description="Enable password for privileged mode (optional)"),
     ] = None,
+    recovery: Annotated[
+        bool,
+        Field(
+            description="Recovery mode: open the transport WITHOUT login or session "
+            "preparation, so a broken device stuck below a usable prompt (no login, "
+            "no '#'/'>') is still reachable. Use this to force-reboot via "
+            "enter_monitor_mode or drive the channel with execute_command(mode='raw'). "
+            "Telnet-oriented (no credentials needed); SSH still authenticates."
+        ),
+    ] = False,
+    auto_relogin: Annotated[
+        bool,
+        Field(
+            description="If the device idle-times out back to its login prompt, "
+            "automatically re-authenticate once on the existing channel before the "
+            "next command (uses the credentials supplied here). On by default."
+        ),
+    ] = True,
 ) -> str:
     """Connect to a network device via SSH or Telnet.
 
@@ -89,6 +109,8 @@ def connect_device(
         protocol=protocol,
         port=port,
         enable_password=enable_password,
+        recovery=recovery,
+        auto_relogin=auto_relogin,
     )
     return _json(result)
 
@@ -158,6 +180,35 @@ def disconnect_device(
 ) -> str:
     """Disconnect from a network device and clean up the connection."""
     return _json(_manager.disconnect(host, port))
+
+
+@mcp.tool
+def relogin_device(
+    host: Annotated[
+        str, Field(description="IP address or hostname of the connected device")
+    ],
+    username: Annotated[
+        Optional[str],
+        Field(description="Username to send (defaults to the one used at connect)"),
+    ] = None,
+    password: Annotated[
+        Optional[str],
+        Field(description="Password to send (defaults to the one used at connect)"),
+    ] = None,
+    port: Annotated[Optional[int], Field(description=_PORT_DESC)] = None,
+) -> str:
+    """Re-authenticate on an existing connection after an idle-timeout drop.
+
+    When a device times out and drops back to its ``Username:`` prompt, the socket is
+    still open. This re-sends credentials on the live channel instead of forcing a
+    disconnect + reconnect. Credentials default to the ones used at connect; pass them
+    explicitly for a connection opened without any (e.g. a recovery connect). Returns a
+    ``[device-mcp]`` footer reporting where the CLI ended up.
+    """
+    try:
+        return _manager.relogin(host, username, password, port)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error: {exc}"
 
 
 @mcp.tool
