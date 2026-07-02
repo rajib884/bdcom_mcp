@@ -569,10 +569,11 @@ def check_transfer_file() -> None:
                              timeout=1.0, port=25)
     assert "did not confirm success" in res3, res3
 
-    # 60-char tftp source-name limit is caught client-side, before any I/O.
-    _attach(mgr, "h:26", _FakeTransfer([]))
+    # A too-long tftp source name is sent as-is; the device's own rejection is
+    # surfaced (the client-side limit lives in recover_firmware's pre-flight).
+    _attach(mgr, "h:26", _FakeTransfer(["file name is too long\n", "monitor#"]))
     res4 = mgr.transfer_file("h", "tftp:" + "A" * 61, "flash:switch.bin", port=26)
-    assert "at most 60" in res4, res4
+    assert "transfer rejected: file name is too long" in res4, res4
     print("transfer_file: OK")
 
 
@@ -705,7 +706,7 @@ def check_idle_logger_preserves_tools() -> None:
 
 
 def check_recover_firmware_guard() -> None:
-    """recover_firmware rejects a non-tftp source before any reboot cycle."""
+    """recover_firmware rejects a bad image source before any reboot cycle."""
     mgr = DeviceConnectionManager()
     _attach(mgr, "h:23", _FakeMonitor())
     res = mgr.recover_firmware(
@@ -713,6 +714,12 @@ def check_recover_firmware_guard() -> None:
         port=23,
     )
     assert "only supports tftp:" in res, res
+    # The bootloader's 60-char tftp source-name limit is also caught pre-reboot.
+    _attach(mgr, "h:24", _FakeMonitor())
+    res2 = mgr.recover_firmware(
+        "h", "tftp:" + "A" * 61, "1.1.1.1", "170.170.170.43", port=24,
+    )
+    assert "at most 60" in res2, res2
     print("recover_firmware tftp guard: OK")
 
 
@@ -750,13 +757,13 @@ async def main() -> None:
     assert "username" not in required and "password" not in required, required
 
     # execute_command: now the merged tool - takes a commands list, mode includes
-    # raw, default mode is auto, and interactive/port params are surfaced.
+    # raw (the default), and interactive/port params are surfaced.
     execute = tools["execute_command"]
     eschema = getattr(execute, "parameters", None) or execute.inputSchema
     eparams = eschema["properties"]
     print("execute_command params:", sorted(eparams))
     assert {"commands", "expect_regex", "answer", "port"} <= set(eparams)
-    assert eparams["mode"].get("default") == "auto", eparams["mode"]
+    assert eparams["mode"].get("default") == "raw", eparams["mode"]
 
     check_resolve_platform()
     check_target()

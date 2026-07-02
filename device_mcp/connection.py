@@ -35,10 +35,10 @@ from netmiko.exceptions import (
 from .bdcom import BdcomSSH, BdcomTelnet
 
 Protocol = Literal["ssh", "telnet"]
-# "auto" (the default) runs at the current privilege level without downgrading;
-# user/enable/config force that exact level. "raw" drives the channel directly
-# (no mode switching, no netmiko prompt detection) for prompts netmiko doesn't
-# know - notably the bootloader "monitor#" shell.
+# "raw" (the default) drives the channel directly (no mode switching, no netmiko
+# prompt detection) for prompts netmiko doesn't know - notably the bootloader
+# "monitor#" shell. "auto" runs at the current privilege level without
+# downgrading; user/enable/config force that exact level.
 Mode = Literal["auto", "user", "enable", "config", "raw"]
 
 # Closed set of reportable session states for the footer's ``now:`` field. The
@@ -647,7 +647,7 @@ class DeviceConnectionManager:
             try:
                 strategy, dispatch = resolve_platform(device_type, protocol)
             except ValueError as exc:
-                return self._failure(host, str(exc), port=resolved_port)
+                return self._failure(str(exc))
 
             opened = _now()
             log_file, log_path = _open_audit_log(
@@ -722,17 +722,17 @@ class DeviceConnectionManager:
                 msg = f"Authentication failed: {exc}"
                 if transcript:
                     msg += f"\n--- last console output ---\n{transcript}"
-                return self._failure(host, msg, port=resolved_port)
+                return self._failure(msg)
             except NetmikoTimeoutException as exc:
                 transcript = console.text(20).strip()
                 console.close()
                 msg = f"Connection timed out: {exc}"
                 if transcript:
                     msg += f"\n--- last console output ---\n{transcript}"
-                return self._failure(host, msg, port=resolved_port)
+                return self._failure(msg)
             except Exception as exc:  # noqa: BLE001 - surface any transport error
                 console.close()
-                return self._failure(host, f"{type(exc).__name__}: {exc}", port=resolved_port)
+                return self._failure(f"{type(exc).__name__}: {exc}")
 
             if auto_bypass_wizard and not recovery:
                 self._maybe_bypass_wizard(connection)
@@ -1384,17 +1384,10 @@ class DeviceConnectionManager:
         accepts ``tftp:`` and limits the source name to 60 chars. Mirrors the
         ``download_configs.py`` / ``tftp_script.py`` copy step.
         """
-        # Fail fast on the device's documented 60-char tftp source-name limit
-        # instead of rebooting first and letting the device reject the command.
-        if source.lower().startswith("tftp:"):
-            name = source[len("tftp:"):]
-            if len(name) > _TFTP_NAME_LIMIT:
-                return _footer(
-                    failure=f"tftp source name is {len(name)} chars; this device's "
-                    f"bootloader 'copy' allows at most {_TFTP_NAME_LIMIT}",
-                    state="unknown",
-                )
-
+        # The bootloader's 60-char tftp source-name limit is NOT enforced here: it
+        # applies to the monitor 'copy' only, and a device that rejects the name
+        # reports "file name is too long", which _TRANSFER_DONE_RE surfaces as a
+        # rejected transfer. recover_firmware fail-fasts on it before rebooting.
         cmd = f"copy {source} {destination}"
         if server:
             cmd += f" {server}"
@@ -1575,6 +1568,15 @@ class DeviceConnectionManager:
                 f"'{scheme}:'); use the tftp relay form, e.g. tftp:f::53/<file>.bin",
                 state="unknown",
             )
+        # Likewise the monitor 'copy' caps the source name at 60 chars; catch it
+        # now instead of rebooting first and letting the device reject the copy.
+        name = image_url[len("tftp:"):]
+        if len(name) > _TFTP_NAME_LIMIT:
+            return _footer(
+                failure=f"tftp source name is {len(name)} chars; the bootloader "
+                f"'copy' allows at most {_TFTP_NAME_LIMIT}",
+                state="unknown",
+            )
 
         out = self.enter_monitor_mode(host, port=port)
         if "entered monitor mode" not in out:
@@ -1678,12 +1680,12 @@ class DeviceConnectionManager:
             try:
                 key = self._resolve(host, port)
             except RuntimeError as exc:
-                return self._failure(host, str(exc), port=port)
+                return self._failure(str(exc))
             conn = self._connections[key]
             try:
                 conn.connection.disconnect()
             except Exception as exc:  # noqa: BLE001
-                return self._failure(host, f"Error disconnecting from {key}: {exc}", port=port)
+                return self._failure(f"Error disconnecting from {key}: {exc}")
             finally:
                 if conn.idle_log_stop is not None:
                     conn.idle_log_stop.set()
@@ -1774,7 +1776,7 @@ class DeviceConnectionManager:
                 pass
 
     @staticmethod
-    def _failure(host: str, message: str, port: int | None = None) -> dict[str, Any]:
+    def _failure(message: str) -> dict[str, Any]:
         return {
             "success": False,
             "message": message,

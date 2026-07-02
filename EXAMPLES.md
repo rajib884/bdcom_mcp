@@ -71,11 +71,11 @@ each is a distinct `host:port` connection:
 }
 ```
 
-### 3. Configuration — `execute_command` with `mode: "config"`
+### 3. Configuration â€” `execute_command` with `mode: "config"`
 
 Send an ordered command list with `mode: "config"`; it is applied as one block
 (config mode entered/exited automatically, sub-mode prompt changes handled), and a
-rejected line is reported with exactly which one failed — no partial config. Put an
+rejected line is reported with exactly which one failed â€” no partial config. Put an
 `exit` as its own list item when moving between contexts:
 
 ```json

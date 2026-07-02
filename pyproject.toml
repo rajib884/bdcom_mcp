@@ -5,7 +5,7 @@ description = "A FastMCP server for network device management via SSH/Telnet. Ex
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "very99" }]
+authors = [{ name = "Rajibul", email = "rajibridoy884@gmail.com" }]
 keywords = [
     "mcp",
     "model-context-protocol",
@@ -36,8 +36,8 @@ dev = [
 device-mcp = "device_mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/very99/cisco-mcp"
-Repository = "https://github.com/very99/cisco-mcp.git"
+Homepage = "https://github.com/rajib884/bdcom_mcp"
+Repository = "https://github.com/rajib884/bdcom_mcp.git"
 
 [build-system]
 requires = ["hatchling"]

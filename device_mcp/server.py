@@ -5,18 +5,19 @@ netmiko-supported platform) over SSH or Telnet. Exposes these tools:
 
     * connect_device       - connect (recovery=True opens the transport without login/
                              prep for a broken device; auto_relogin re-auths on idle drop)
-    * execute_command      - run one or more commands (mode=config = atomic block;
-                             mode=raw = drive the channel directly, e.g. monitor#)
+    * execute_command      - run one or more commands (mode=raw, the default, drives
+                             the channel directly, e.g. monitor#; mode=config = atomic block)
     * relogin_device       - re-authenticate on the live channel after an idle-timeout drop
     * disconnect_device
     * list_connections
     * get_console_history
     * read_console_stream
     * get_help
+    * enter_monitor_mode   - force-reboot into the bootloader monitor# shell
 
 The file-transfer / firmware tools (transfer_file, upgrade_firmware,
-enter_monitor_mode, recover_firmware) and their manager methods exist but are
-currently disabled (commented out below).
+recover_firmware) and their manager methods exist but are currently disabled
+(commented out below).
 
 Connections are addressed by host, plus a ``port`` that is required only when
 several devices share an IP (a console/terminal server).
@@ -134,13 +135,14 @@ def execute_command(
     mode: Annotated[
         Literal["raw", "user", "enable", "config", "auto"],
         Field(
-            description="auto runs at the current privilege level without "
-            "downgrading; user/enable/config force that level (config applies the "
-            "list as one atomic block); raw (default) drives the channel directly (where a "
-            "normal command would wait for the device's usual 'Switch.*' prompt and "
-            "never be sent)."
+            description="raw (the default) drives the channel directly at the live "
+            "prompt - needed where netmiko doesn't know the prompt (e.g. the "
+            "bootloader monitor# shell, where a normal command would wait for the "
+            "device's usual 'Switch.*' prompt and never be sent). auto runs at the "
+            "current privilege level without downgrading; user/enable/config force "
+            "that level (config applies the list as one atomic block)."
         ),
-    ] = "auto",
+    ] = "raw",
     expect_regex: Annotated[
         Optional[str],
         Field(description="Regex to expect for an interactive confirmation, e.g. "

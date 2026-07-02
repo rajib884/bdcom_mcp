@@ -18,7 +18,7 @@ platform.
 - **🧩 Multi-Vendor**: Cisco IOS (default), BDCOM, and 400+ netmiko platforms via a `device_type` selector
 - **🔄 Persistent Connections**: Maintain long-lived connections for efficient command execution
 - **🎯 Universal Command Execution**: Execute any device command through a single interface
-- **🔐 Mode Management**: `auto` default runs at the current privilege level without downgrading; `user`/`enable`/`config` force a level
+- **🔐 Mode Management**: `raw` default drives the channel directly at the live prompt; `auto` runs at the current privilege level without downgrading; `user`/`enable`/`config` force a level
 - **🧾 Self-describing results**: every command returns its raw output plus a `[device-mcp]` footer reporting device errors (vs transport failures) and where the CLI ended up — see [Result footer](#-result-footer)
 - **🧱 One-or-many commands**: `execute_command` takes a command **list**; `mode=config` applies it as an atomic block (sub-mode nesting handled, exact failing line reported), other modes run them in order
 - **🌐 Multi-Device Support**: Manage many devices at once — including several behind **one IP on different ports** (console/terminal servers), addressed as `host:port`
@@ -26,7 +26,7 @@ platform.
 - **📜 Console Diagnostics & audit logs**: live raw-I/O history (`get_console_history`) plus an always-on per-connection log file under `./logs` (`DEVICE_MCP_LOG_DIR` to relocate) capturing the full session for later audit
 - **❓ Inline Help**: Query CLI `?` help with `get_help` (parsed `options:` footer)
 - **💡 Dialect hints**: a rejected/aborted command that's a known Cisco-ism gets a `hint:` with the BDCOM equivalent; a dropped session is reported as `SESSION_TERMINATED`
-- **🛠 Raw mode**: `mode=raw` drives the channel directly for prompts netmiko doesn't know — e.g. rebooting from the bootloader `monitor#` shell
+- **🛠 Raw mode**: `mode=raw` (the default) drives the channel directly for prompts netmiko doesn't know — e.g. rebooting from the bootloader `monitor#` shell
 - **🤖 AI-Friendly**: Natural language command translation through AI assistants
 - **📊 Connection Monitoring**: Track active connections and their status
 
@@ -131,7 +131,7 @@ the CLI ended up (see [Result footer](#-result-footer)).
 - `host` (required): Target device IP/hostname
 - `commands` (required): Ordered list of commands. A single command is a one-item
   list, e.g. `["show version"]`.
-- `mode` (optional): `auto` (default), `user`, `enable`, `config`, or `raw`.
+- `mode` (optional): `raw` (default), `auto`, `user`, `enable`, or `config`.
   - `auto` runs at the current privilege level **without downgrading** (so `show`
     works on BDCOM, which connects in enable); `user`/`enable` force that level.
   - **`config`** applies the whole list as one **atomic** config block (enters/exits
@@ -139,10 +139,10 @@ the CLI ended up (see [Result footer](#-result-footer)).
     line is reported with which one failed and where the session was left — no
     partial config applied silently. Send a sub-mode `exit` as its own list item
     when moving between contexts.
-  - **`raw`** bypasses mode switching and prompt detection, driving the channel
-    directly — needed at prompts netmiko doesn't know, notably the bootloader
-    `monitor#` shell (where a normal `reboot` waits for the device's usual `Switch.*`
-    prompt and is never sent).
+  - **`raw`** (the default) bypasses mode switching and prompt detection, driving
+    the channel directly — needed at prompts netmiko doesn't know, notably the
+    bootloader `monitor#` shell (where a normal `reboot` waits for the device's
+    usual `Switch.*` prompt and is never sent).
 - `expect_regex` (optional): Regex for an interactive confirmation prompt (honored
   only when a single command is given)
 - `answer` (optional): Reply to send when `expect_regex` matches
@@ -219,9 +219,20 @@ input line so the next command runs cleanly. The footer lists the parsed next-to
 **Parameters:** `host` (required), `command_prefix` (optional, e.g. `"show "`),
 `port` (optional).
 
+#### `enter_monitor_mode`
+Drop the device into the bootloader `monitor#` shell. Two stages: (1) initiate a
+reboot — tries the hidden boot menu first (**Ctrl-]**, then the single-keystroke
+reboot option; works even at a login prompt), falling back to `reboot`+`y`; (2)
+after `RTC Test`, sends a short **Ctrl-P** burst to interrupt the boot into monitor
+mode (without it the unit boots normally).
+Returns the boot transcript and a `now: monitor#` footer on success.
+
+**Parameters:** `host` (required), `timeout` (optional seconds, default 180),
+`port` (optional).
+
 ---
 
-> **⚠️ The four file-transfer / firmware tools below are currently disabled**
+> **⚠️ The three file-transfer / firmware tools below are currently disabled**
 > (commented out in [`server.py`](device_mcp/server.py)). Their manager methods still
 > exist and are unit-tested; re-enable the `@mcp.tool` wrappers to expose them.
 
@@ -242,17 +253,6 @@ broken to boot that far, use `recover_firmware`.
 
 **Parameters:** `host`, `image_url`, `server` (required), `flash_name` (optional,
 default `switch.bin`), `reboot` (optional bool, default true), `port` (optional).
-
-#### `enter_monitor_mode`
-Drop the device into the bootloader `monitor#` shell. Two stages: (1) initiate a
-reboot — tries the hidden boot menu first (**Ctrl-]**, then the single-keystroke
-reboot option; works even at a login prompt), falling back to `reboot`+`y`; (2)
-after `RTC Test`, sends a short **Ctrl-P** burst to interrupt the boot into monitor
-mode (without it the unit boots normally).
-Returns the boot transcript and a `now: monitor#` footer on success.
-
-**Parameters:** `host` (required), `timeout` (optional seconds, default 180),
-`port` (optional).
 
 #### `recover_firmware`
 End-to-end firmware recovery via the `monitor#` shell, for a unit too broken to
@@ -425,8 +425,9 @@ it appends the right command as a `hint:`):
 - **Sub-modes don't auto-exit:** `vlan X`, `interface X`, `ip vrf X` each open a
   sub-mode; send an explicit `exit` between contexts — `execute_command` with
   `mode=config` and the `exit` lines in the list handles this.
-- **Privileged for `show`:** BDCOM `show` needs enable mode; the default `auto`
-  mode keeps you there after connect, so no `mode` is needed.
+- **Privileged for `show`:** BDCOM `show` needs enable mode; the session lands in
+  enable at connect and the default `raw` mode runs at that live prompt, so no
+  `mode` is needed.
 
 ### 🔒 Security Notes
 
@@ -522,11 +523,12 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 #### `execute_command`
 在已连接的设备上执行**一条或多条**命令（`commands` 为命令列表，单条命令用单元素列表）。
-`mode` 默认 `auto`（在当前权限级别执行、不降级；BDCOM 连接后处于 enable，`show` 可直接工作），
-也可强制 `user`/`enable`；**`config`** 将整个列表作为一个原子配置块下发（自动进出配置模式、
-处理子模式提示符；某条被拒绝时 footer 指出是哪一条且不会留下半套配置）；**`raw`** 直接驱动
-通道，用于 netmiko 不认识的提示符（如引导加载器 `monitor#`，普通 `reboot` 会一直等待
-`Switch.*` 提示符而发不出去）。返回每条命令的原始输出加一行 `[device-mcp]` footer。支持
+`mode` 默认 `raw`（直接驱动通道、在当前提示符下执行，用于 netmiko 不认识的提示符，如引导
+加载器 `monitor#`，普通 `reboot` 会一直等待 `Switch.*` 提示符而发不出去）；`auto` 在当前
+权限级别执行、不降级（BDCOM 连接后处于 enable，`show` 可直接工作），也可强制
+`user`/`enable`；**`config`** 将整个列表作为一个原子配置块下发（自动进出配置模式、
+处理子模式提示符；某条被拒绝时 footer 指出是哪一条且不会留下半套配置）。
+返回每条命令的原始输出加一行 `[device-mcp]` footer。支持
 `expect_regex` + `answer` 应答交互式 `(y/n)` 确认（仅单条命令时生效）；`port` 仅在同一 IP
 有多台设备时需要。
 
@@ -546,6 +548,11 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 发送 `command_prefix + '?'` 返回设备的内联 CLI 帮助，并清理输入行；footer 列出解析出的
 下一级 `options:`。会归一化前缀（去掉手动多写的 `?`、合并多余尾随空格），长列表（如 `ip ?`）
 不再被截断。
+
+#### `enter_monitor_mode`
+让设备进入引导加载器 `monitor#` 恢复外壳：先通过隐藏启动菜单（Ctrl-]，单键选项）或
+`reboot`+`y` 触发重启，在 `RTC Test` 后发送 Ctrl-P 中断启动进入 monitor 模式。
+成功时返回启动记录及 `now: monitor#` footer。
 
 ### 📟 BDCOM 说明
 
