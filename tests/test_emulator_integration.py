@@ -279,6 +279,81 @@ def test_auto_relogin_recovers_transparently(manager, make_switch):
     assert "12:00:00" in out
 
 
+def test_logout_via_exit_then_relogin(manager, make_switch):
+    """A genuine user-initiated logout ('exit' twice) is detected; relogin recovers.
+
+    Unlike test_relogin_after_idle_drop (which flips the emulator's drop_to_login
+    switch), this walks the CLI path a user would type: BDCOM leaves enable with
+    'exit' (Switch# -> Switch>) and a second 'exit' logs out to the login prompt,
+    with the socket still open. relogin must re-auth on that same socket - no
+    disconnect/reconnect - and land back in enable with paging off.
+    """
+    sw = make_switch(responses={"show clock": "12:00:00"})
+    _connect(manager, sw)
+    # Establish the tracked mode from a real command first (it defaults to "user"
+    # at connect until a command refreshes it from the live prompt).
+    manager.execute_command(HOST, "show clock", port=sw.port)
+    (before,) = manager.list_connections()
+    assert before["current_mode"] == "enable"
+
+    # exit #1: enable -> user. Clean raw output ends at the '>' prompt, and the
+    # manager's tracked mode follows the real prompt down.
+    out = manager.execute_command(HOST, "exit", port=sw.port)
+    assert out.rstrip().endswith("Switch>"), out
+    (conn,) = manager.list_connections()
+    assert conn["current_mode"] == "user"
+
+    # exit #2: user -> logged out. The footer names the state instead of leaking
+    # the raw 'Username:' buffer text.
+    out = manager.execute_command(HOST, "exit", port=sw.port)
+    assert "device returned to login prompt" in out, out
+    assert "now: awaiting_login" in out, out
+
+    # Relogin re-sends the stored credentials on the live channel and re-runs
+    # session_preparation: elevate to enable, disable paging - verified on the wire.
+    sw.clear_command_history()
+    relog = manager.relogin(HOST, port=sw.port)
+    assert "re-logged in" in relog, relog
+    assert "now: Switch# (enable)" in relog, relog
+    assert "enable" in sw.commands_seen
+    assert "terminal length 0" in sw.commands_seen
+
+    # Same connection object, same socket - not a reconnect.
+    (after,) = manager.list_connections()
+    assert after["connected_at"] == before["connected_at"]
+    assert after["current_mode"] == "enable"
+
+    # And the session is fully usable again.
+    out = manager.execute_command(HOST, "show clock", port=sw.port)
+    assert "12:00:00" in out
+    assert out.rstrip().endswith("Switch#"), out
+
+
+def test_relogin_rejects_wrong_credentials(manager, make_switch):
+    """A relogin with bad explicit credentials reports failure, not a bogus 'ok'."""
+    sw = make_switch()
+    _connect(manager, sw)
+    manager.execute_command(HOST, "exit", port=sw.port)   # enable -> user
+    out = manager.execute_command(HOST, "exit", port=sw.port)  # user -> logged out
+    assert "now: awaiting_login" in out, out
+    relog = manager.relogin(HOST, username="admin", password="wrong", port=sw.port)
+    assert "re-login failed" in relog, relog
+    assert "now: awaiting_login" in relog, relog
+
+
+def test_auto_relogin_after_exit_logout(manager, make_switch):
+    """With auto_relogin, the first command after an exit-logout re-auths and runs."""
+    sw = make_switch(responses={"show clock": "12:00:00"})
+    _connect(manager, sw, auto_relogin=True)
+    manager.execute_command(HOST, "exit", port=sw.port)   # enable -> user
+    out = manager.execute_command(HOST, "exit", port=sw.port)  # user -> logged out
+    assert "now: awaiting_login" in out, out
+    # The next command finds the session at the login prompt and recovers by itself.
+    out = manager.execute_command(HOST, "show clock", port=sw.port)
+    assert "12:00:00" in out, out
+    assert out.rstrip().endswith("Switch#"), out  # back at the enable prompt
+
+
 # ----------------------------------------------------------------- dialect
 
 def test_cisco_dialect_prompts_and_config(manager, make_switch):
