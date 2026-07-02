@@ -30,6 +30,7 @@ from netmiko.exceptions import (
     ConfigInvalidException,
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
+    ReadTimeout,
 )
 
 from .bdcom import BdcomSSH, BdcomTelnet
@@ -118,6 +119,15 @@ _CARET_LINE_RE = re.compile(r"^(\s*)\^\s*$")
 _LOGIN_PROMPT_RE = re.compile(r"(?im)^\s*(?:Username|Login|Password)\s*:\s*$")
 _AUTH_FAILED_RE = re.compile(r"(?i)Authentication failed")
 _LOGGED_OUT_RE = re.compile(r"(?i)logged out|User .*? logged out")
+# End-of-buffer login/CLI classifiers for the relogin flow: the *tail* of what
+# the device just sent decides what to type next (a mid-buffer "Username:" may
+# already be stale boot churn - seen on real hardware after a reboot).
+_ASK_USERNAME_RE = re.compile(r"(?:[Uu]sername|[Ll]ogin)\s*:\s*$")
+_ASK_PASSWORD_RE = re.compile(r"[Pp]assword\s*:\s*$")
+_CLI_TAIL_RE = re.compile(r"[>#]\s*$")
+_RELOGIN_SETTLE_RE = re.compile(
+    r"(?:[Uu]sername|[Ll]ogin|[Pp]assword)\s*:\s*$|[>#]\s*$"
+)
 # The BDCOM bootloader recovery shell prompt (e.g. "monitor#").
 _MONITOR_PROMPT_RE = re.compile(r"(?im)^\s*monitor\s*#")
 
@@ -443,6 +453,30 @@ def _send_and_read(
     return _read_until(net, pattern, timeout=timeout, idle=idle)
 
 
+def _drain_quiet(net: Any, *, quiet: float = 0.7, timeout: float = 8.0) -> str:
+    """Read until the channel has been silent for ``quiet`` seconds.
+
+    Unlike :func:`_read_until` (which needs at least some data before its idle
+    break), an already-quiet channel returns promptly here. This is the settle
+    step before re-login: a rebooting device keeps spewing boot messages and
+    ``Username:`` redraws, and credentials sent into that churn are swallowed.
+    Returns whatever was drained (it is already in the console ring/audit log).
+    """
+    acc = ""
+    start = time.time()
+    last_data = start
+    while time.time() - start < timeout:
+        chunk = net.read_channel()
+        if chunk:
+            acc += chunk
+            last_data = time.time()
+        elif time.time() - last_data >= quiet:
+            break
+        else:
+            time.sleep(0.1)
+    return acc
+
+
 def _parse_help_tokens(output: str) -> list[str]:
     """Parse next-token names from CLI '?' help lines (``token  -- description``)."""
     tokens = []
@@ -486,6 +520,8 @@ def _footer(
         head = "ERROR: " + device_error["message"]
         if near:
             head += f" near '{near}'"
+        if note:
+            head += f" | {note}"
     elif note:
         head = note
     elif options is not None:
@@ -548,6 +584,7 @@ class _ConsoleRingLog(io.BufferedIOBase):
         self._lines: deque[str] = deque(maxlen=maxlen)
         self._partial = ""
         self._file = file
+        self._total = 0  # complete lines ever written; see mark()/text_since()
 
     def writable(self) -> bool:
         return True
@@ -561,6 +598,7 @@ class _ConsoleRingLog(io.BufferedIOBase):
         parts = (self._partial + text).split("\n")
         self._partial = parts.pop()
         self._lines.extend(parts)
+        self._total += len(parts)
         if self._file is not None:
             try:
                 self._file.write(text)
@@ -574,6 +612,25 @@ class _ConsoleRingLog(io.BufferedIOBase):
         if self._partial:
             lines.append(self._partial)
         if limit is not None and limit >= 0:
+            lines = lines[-limit:]
+        return "\n".join(lines)
+
+    def mark(self) -> int:
+        """Position marker: the count of complete lines written so far.
+
+        Take a mark before sending a command, then :meth:`text_since` recovers what
+        the device sent afterwards - even when the read itself raised (e.g. a
+        ReadTimeout whose output netmiko discards).
+        """
+        return self._total
+
+    def text_since(self, mark: int, limit: int = 500) -> str:
+        """Return the lines written after ``mark`` (plus any trailing partial)."""
+        new = self._total - mark
+        lines = list(self._lines)[-new:] if new > 0 else []
+        if self._partial:
+            lines.append(self._partial)
+        if len(lines) > limit:
             lines = lines[-limit:]
         return "\n".join(lines)
 
@@ -846,54 +903,142 @@ class DeviceConnectionManager:
         username: str | None = None,
         password: str | None = None,
     ) -> str:
-        """Drive username/password on the live channel. Caller holds the lock."""
+        """Drive username/password on the live channel. Caller holds the lock.
+
+        Hardened against what real hardware does after a reboot (session log
+        2026-07-02): the console keeps redrawing ``Username:`` between boot
+        messages, and credentials fired off immediately are swallowed by that
+        churn. Each attempt therefore (1) lets the channel go quiet, (2) sends a
+        bare RETURN to provoke a fresh prompt (this also satisfies BDCOM's
+        'Press RETURN to get started'), and (3) types the username/password only
+        when the buffer *ends* at the matching login prompt. If the probe comes
+        back with a CLI prompt instead, the session is still logged in - nothing
+        is typed (credentials sent at a live prompt would run as commands) and
+        the footer says so. One internal retry covers an attempt that raced
+        leftover churn.
+        """
         net = conn.connection
         conn.last_activity = _now()
         user = username if username is not None else conn.config.get("username")
         pwd = password if password is not None else conn.config.get("password")
         out = ""
+        sent_credentials = False
+        reached_cli = False
         try:
-            try:
-                net.read_channel()  # drain residue before re-authenticating
-            except Exception:  # noqa: BLE001
-                pass
-            # Send the username and wait for the password prompt; then the password
-            # and wait for a CLI prompt (success) or an auth-failure line.
-            if user is not None:
-                out += _send_and_read(net, user, _LOGIN_PROMPT_RE, timeout=15.0, idle=1.0)
-            if pwd is not None:
-                out += _send_and_read(
-                    net, pwd, re.compile(r"[>#]\s*$|Authentication failed"),
-                    timeout=15.0, idle=1.0,
+            for _attempt in range(2):
+                out += _drain_quiet(net)
+                # A bare RETURN makes whatever is listening redraw its prompt (a
+                # login field, 'Press RETURN to get started', or the CLI itself).
+                probe = _send_and_read(
+                    net, "", _RELOGIN_SETTLE_RE, timeout=8.0, idle=1.0
                 )
-            else:
-                out += _read_until(net, _CLI_PROMPT_RE, timeout=10.0, idle=1.0)
-            # Re-establish base prompt / enable / paging exactly as on first connect,
-            # using the driver's own session_preparation so per-platform behavior
-            # matches. We just consumed the post-login prompt, so prime the channel
-            # with a RETURN first - otherwise session_preparation's initial channel
-            # read finds no data and raises before it can elevate.
+                out += probe
+                tail = probe if probe.strip() else out
+                if _ASK_USERNAME_RE.search(tail):
+                    if user is None:
+                        return out.rstrip("\n") + "\n\n" + _footer(
+                            failure="re-login failed: the device asks for a "
+                            "username but none was supplied - pass username/password",
+                            state="awaiting_login",
+                        )
+                    sent_credentials = True
+                    tail = _send_and_read(
+                        net, user,
+                        re.compile(r"[Pp]assword\s*:\s*$|[>#]\s*$"),
+                        timeout=15.0, idle=1.0,
+                    )
+                    out += tail
+                if _ASK_PASSWORD_RE.search(tail):
+                    if pwd is None:
+                        return out.rstrip("\n") + "\n\n" + _footer(
+                            failure="re-login failed: the device asks for a "
+                            "password but none was supplied - pass username/password",
+                            state="awaiting_login",
+                        )
+                    sent_credentials = True
+                    tail = _send_and_read(
+                        net, pwd,
+                        re.compile(r"[>#]\s*$|[Aa]uthentication fail"),
+                        timeout=15.0, idle=1.0,
+                    )
+                    out += tail
+                if _CLI_TAIL_RE.search(tail):
+                    reached_cli = True
+                    break
+                # Not at a CLI prompt: auth failed, or the channel was still
+                # churning when we typed - settle again and retry once.
+        except Exception as exc:  # noqa: BLE001
+            prompt, state = _describe_session(net, conn.console)
+            return out.rstrip("\n") + "\n\n" + _footer(
+                failure=f"re-login failed: {type(exc).__name__}: {exc}",
+                prompt=prompt, state=state,
+            )
+
+        if reached_cli and not sent_credentials:
+            # The probe answered with a live CLI prompt: we were never logged
+            # out. Typing credentials here would execute them as commands.
+            prompt, state = _describe_session(net, conn.console)
+            conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
+            return out.rstrip("\n") + "\n\n" + _footer(
+                note="already logged in - nothing sent", prompt=prompt, state=state
+            )
+
+        if reached_cli:
+            # Re-establish base prompt / enable / paging exactly as on first
+            # connect, using the driver's own session_preparation so per-platform
+            # behavior matches. We just consumed the post-login prompt, so prime
+            # the channel with a RETURN first - otherwise session_preparation's
+            # initial channel read finds no data and raises before it can elevate.
             try:
                 net.write_channel(getattr(net, "RETURN", "\n"))
                 time.sleep(0.3)
                 net.session_preparation()
             except Exception:  # noqa: BLE001 - best effort, mirrors connect()
                 pass
-        except Exception as exc:  # noqa: BLE001
-            prompt, state = _describe_session(net, conn.console)
-            return out.rstrip("\n") + "\n\n" + _footer(
-                failure=f"{type(exc).__name__}: {exc}", prompt=prompt, state=state
-            )
 
         prompt, state = _describe_session(net, conn.console)
         conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
-        if state in ("awaiting_login", "session_terminated"):
+        if not reached_cli or state in ("awaiting_login", "session_terminated"):
             return out.rstrip("\n") + "\n\n" + _footer(
                 failure="re-login failed (still at login prompt)",
                 prompt=prompt, state=state,
             )
         return out.rstrip("\n") + "\n\n" + _footer(
             note="re-logged in", prompt=prompt, state=state
+        )
+
+    def _ensure_session_ready(self, conn: DeviceConnection) -> Optional[str]:
+        """Refuse to type into a login prompt. Caller holds the lock.
+
+        Returns a refusal footer when the session sits at a login prompt and could
+        not be recovered, else ``None``. Without this, a command issued after an
+        idle logout / reboot is typed straight into the ``Username:`` field (seen
+        on real hardware: ``Username: show vlan`` ... ``%SYS-5-AUTH: User show vlan
+        Authorization failed``). auto_relogin connections get one recovery attempt
+        first, and its failure is surfaced instead of silently degrading. A
+        recovery-mode connection is exempt: raw driving of arbitrary prompts
+        (including a login field) is its whole point.
+        """
+        if conn.config.get("recovery"):
+            return None
+        _, pre_state = _describe_session(conn.connection, conn.console)
+        if pre_state not in ("awaiting_login", "session_terminated"):
+            return None
+        if conn.config.get("auto_relogin"):
+            self._relogin(conn)
+            _, state = _describe_session(conn.connection, conn.console)
+            if state not in ("awaiting_login", "session_terminated"):
+                return None
+            return _footer(
+                failure="auto-relogin failed; the command was NOT sent - call "
+                "relogin_device with working credentials, or disconnect and "
+                "connect again",
+                state=state,
+            )
+        return _footer(
+            failure="session is at the login prompt; the command was NOT sent - "
+            "call relogin_device to re-authenticate (or disconnect and connect again)",
+            state=pre_state,
         )
 
     # ------------------------------------------------------------------ execute
@@ -908,7 +1053,9 @@ class DeviceConnectionManager:
     ) -> str:
         """Run one or more commands and return their combined output + footers.
 
-        ``mode="config"`` applies the whole list atomically (``configure``); any other
+        ``mode="config"`` applies the whole list as one config block via
+        :meth:`configure` (a rejected line stops the block; earlier lines stay
+        applied). Any other
         mode runs the commands sequentially via :meth:`execute_command`. An interactive
         ``expect_regex``/``answer`` is honored only for a lone command (a ``(y/n)``
         confirm is inherently single-command). This is the single entry point the
@@ -963,16 +1110,23 @@ class DeviceConnectionManager:
 
             net = conn.connection
             conn.last_activity = _now()
-            # Opt-in: if the device idle-timed out back to its login prompt, re-auth
-            # once on the live channel before running the command (single bounded
-            # attempt so a flapping device can't trigger a credential-spray loop).
-            if conn.config.get("auto_relogin"):
-                _, pre_state = _describe_session(net, conn.console)
-                if pre_state in ("awaiting_login", "session_terminated"):
-                    self._relogin(conn)
+            # Never type into a login prompt: recover via auto_relogin when
+            # enabled, otherwise refuse with a clear footer (see the method doc).
+            refusal = self._ensure_session_ready(conn)
+            if refusal is not None:
+                return refusal
             if mode == "raw":
                 return self._execute_raw(conn, command, expect_regex, answer)
+            mark = conn.console.mark() if conn.console is not None else None
             try:
+                # Drop stale buffered bytes (leftover prompt redraws from session
+                # prep, unsolicited log lines) so they cannot satisfy netmiko's
+                # prompt matcher early and truncate this command's output. They
+                # are already captured in the console ring / audit log.
+                try:
+                    net.read_channel()
+                except Exception:  # noqa: BLE001
+                    pass
                 self._switch_mode(conn, mode)
                 if mode == "config":
                     # Prompt changes in config mode, so use timing-based reads.
@@ -1004,11 +1158,35 @@ class DeviceConnectionManager:
                     output = net.send_command(command, read_timeout=_EXEC_READ_TIMEOUT)
             except Exception as exc:  # noqa: BLE001 - report what broke + where we are
                 prompt, state = _describe_session(net, conn.console)
+                # What the device really sent is in the console ring even though
+                # the netmiko call raised - return it instead of dropping it.
+                tail = (
+                    conn.console.text_since(mark).rstrip("\n")
+                    if (conn.console is not None and mark is not None)
+                    else ""
+                )
+                body = tail + "\n\n" if tail.strip() else ""
                 if state in ("awaiting_login", "session_terminated"):
-                    return _footer(terminated=True, prompt=prompt, state=state,
-                                   hint=_dialect_hint(command))
-                return _footer(failure=f"{type(exc).__name__}: {exc}",
-                               prompt=prompt, state=state, hint=_dialect_hint(command))
+                    return body + _footer(terminated=True, prompt=prompt, state=state,
+                                          hint=_dialect_hint(command))
+                if isinstance(exc, ReadTimeout) and state in (
+                    "user", "enable", "config", "monitor"
+                ):
+                    # The wait pattern never matched but the device is sitting at
+                    # a prompt: the command actually completed (e.g. an immediate
+                    # error instead of the expected (y/n) confirm). Report its
+                    # real output with a note, not a bare ReadTimeout.
+                    never = (
+                        f"expect_regex {expect_regex!r} never matched"
+                        if expect_regex else "prompt pattern never matched"
+                    )
+                    return body + _footer(
+                        device_error=_detect_device_error(tail), note=never,
+                        prompt=prompt, state=state,
+                    )
+                return body + _footer(failure=f"{type(exc).__name__}: {exc}",
+                                      prompt=prompt, state=state,
+                                      hint=_dialect_hint(command))
 
             prompt, state = _describe_session(net, conn.console)
             conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
@@ -1182,9 +1360,11 @@ class DeviceConnectionManager:
         """Apply a sequence of config commands as one block; return output+footer.
 
         Uses netmiko ``send_config_set``: enters config mode, sends each command in
-        order (tolerating submode prompt changes), then exits config mode. If a
-        command is rejected the footer reports which one and where the session was
-        left, instead of silently applying a partial/wrong config.
+        order (tolerating submode prompt changes), then exits config mode. A
+        rejected command stops the block and the footer reports which one failed;
+        commands **before** it are already applied on the device and stay applied
+        (there is no rollback), and config mode is exited so the session is not
+        left stranded in a sub-mode.
         """
         with self._lock:
             conn = self._connections[self._resolve(host, port)]
@@ -1194,6 +1374,9 @@ class DeviceConnectionManager:
                 )
             net = conn.connection
             conn.last_activity = _now()
+            refusal = self._ensure_session_ready(conn)
+            if refusal is not None:
+                return refusal
             try:
                 # BDCOM (and Cisco) only accept config from privileged mode;
                 # send_config_set enters config but assumes enable first.
@@ -1205,13 +1388,24 @@ class DeviceConnectionManager:
                     read_timeout=_CONFIG_READ_TIMEOUT,
                 )
             except ConfigInvalidException as exc:
-                # send_config_set may strand the session in a submode on error.
+                # A rejected line stops the block; the lines before it are already
+                # applied on the device (no rollback). Exit config mode so the
+                # session is not left stranded in a sub-mode, then be honest about
+                # the partial apply in the footer.
+                try:
+                    net.exit_config_mode()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
                 prompt, state = _describe_session(net, conn.console)
                 conn.current_mode = state if state in ("user", "enable", "config") else conn.current_mode
                 hint = next((_dialect_hint(c) for c in commands if _dialect_hint(c)), None)
                 if state in ("awaiting_login", "session_terminated"):
                     return _footer(terminated=True, prompt=prompt, state=state, hint=hint)
-                return _footer(failure=str(exc), prompt=prompt, state=state, hint=hint)
+                return _footer(
+                    failure=f"{exc} | lines before the rejected one were already "
+                    "applied and remain in effect (no rollback)",
+                    prompt=prompt, state=state, hint=hint,
+                )
             except Exception as exc:  # noqa: BLE001
                 prompt, state = _describe_session(net, conn.console)
                 hint = next((_dialect_hint(c) for c in commands if _dialect_hint(c)), None)
@@ -1254,7 +1448,12 @@ class DeviceConnectionManager:
 
         Accumulates whatever the device emits without sending a command - handy for
         watching a reboot back to the login prompt. Partial output is always
-        returned (even on timeout). Holds the manager lock for its duration.
+        returned (even on timeout); a read that saw nothing at all returns a
+        ``no output within Ns`` footer so "no data" is not mistaken for a failure.
+        Only bytes arriving *during* this call are returned: output emitted between
+        tool calls is drained into the console history by the idle poller - use
+        ``get_console_history`` for that backlog. Holds the manager lock for its
+        duration.
         """
         timeout = max(0.0, min(float(timeout), _MAX_STREAM_TIMEOUT))
         pattern = re.compile(expect_pattern) if expect_pattern else None
@@ -1272,7 +1471,12 @@ class DeviceConnectionManager:
                         break
                 else:
                     time.sleep(0.2)
-            return acc
+            if acc.strip():
+                return acc
+            prompt, state = _describe_session(net, conn.console)
+            return _footer(
+                note=f"no output within {timeout:g}s", prompt=prompt, state=state
+            )
 
     def get_help(
         self, host: str, command_prefix: str = "", port: int | None = None
@@ -1304,6 +1508,9 @@ class DeviceConnectionManager:
             conn = self._connections[self._resolve(host, port)]
             net = conn.connection
             conn.last_activity = _now()
+            refusal = self._ensure_session_ready(conn)
+            if refusal is not None:
+                return refusal
 
             # Capture the base prompt first: after listing help, the device redraws
             # exactly this prompt (ending '#' in enable/config, '>' in user mode)
@@ -1335,6 +1542,13 @@ class DeviceConnectionManager:
             # (plus margin) so a device that never bells can't spin.
             self._clear_input_line(net, len(prefix) + 8)
             prompt, state = _describe_session(net, conn.console)
+            # After help, the console tail ends in "<prompt><prefix>" plus the
+            # backspaces that cleared it, which classifies as unknown (or scans an
+            # old login banner in the ring window as awaiting_login). The base
+            # prompt captured just before sending '?' is the ground truth here.
+            if state not in ("user", "enable", "config", "monitor") and base_prompt:
+                prompt = base_prompt.strip()
+                state = _classify_session(prompt)
 
         device_error = _detect_device_error(out)
         if device_error:

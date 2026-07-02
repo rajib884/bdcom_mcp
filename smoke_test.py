@@ -345,27 +345,73 @@ def check_get_help_clears_line() -> None:
 
 
 class _FakeLoginNet:
-    """A netmiko stand-in stuck at a login prompt (a desynced session)."""
+    """A netmiko stand-in whose command drops the session to the login prompt.
+
+    Healthy at the pre-send probe (so the login-prompt guard lets the command
+    through), then the send itself fails EOF-style and every later probe finds the
+    login prompt - modelling BDCOM's 'write memory' forced logout on the wire.
+    """
+
+    RETURN = "\n"
 
     def __init__(self) -> None:
         self.sent: list[str] = []
+        self.dropped = False
+
+    def read_channel(self) -> str:
+        return ""
 
     def check_enable_mode(self) -> bool:
-        return False
+        return not self.dropped
 
     def check_config_mode(self) -> bool:
         return False
 
     def find_prompt(self) -> str:
-        return "Username:"
+        return "Username:" if self.dropped else "Switch#"
+
+    def normalize_cmd(self, command: str) -> str:
+        return command + self.RETURN
+
+    def write_channel(self, data: str) -> None:
+        if data.strip():
+            self.sent.append(data.strip())
+            self.dropped = True
+            raise EOFError("telnet connection closed")
 
     def send_command(self, command: str, **kw) -> str:
         self.sent.append(command)
+        self.dropped = True
         raise RuntimeError("Pattern not detected: 'Switch.*'")
 
     def send_command_timing(self, command: str, **kw) -> str:
         self.sent.append(command)
+        self.dropped = True
         raise RuntimeError("Pattern not detected")
+
+
+class _FakeAtLogin:
+    """A netmiko stand-in already sitting at the login prompt (idle logout)."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def read_channel(self) -> str:
+        return ""
+
+    def find_prompt(self) -> str:
+        return "Username:"
+
+    def write_channel(self, data: str) -> None:
+        self.sent.append(data)
+
+    def send_command(self, command: str, **kw) -> str:
+        self.sent.append(command)
+        return ""
+
+    def send_command_timing(self, command: str, **kw) -> str:
+        self.sent.append(command)
+        return ""
 
 
 class _FakeTransfer:
@@ -545,6 +591,24 @@ def check_session_terminated() -> None:
     res2 = mgr.execute_command("h", "write memory", port=24)
     assert "device returned to login prompt" in res2 and "hint:" in res2, res2
     print("session terminated reporting: OK")
+
+
+def check_login_prompt_guard() -> None:
+    """A command against a session already at the login prompt is refused, not typed."""
+    mgr = DeviceConnectionManager()
+    net = _FakeAtLogin()
+    _attach(mgr, "h:23", net)
+    res = mgr.execute_command("h", "show vlan", port=23)
+    assert "NOT sent" in res, res
+    assert "relogin_device" in res, res
+    assert "now: awaiting_login" in res, res
+    assert net.sent == [], net.sent          # nothing reached the wire
+    # config blocks are guarded the same way.
+    net2 = _FakeAtLogin()
+    _attach(mgr, "h:24", net2)
+    res2 = mgr.configure("h", ["vlan 10", "exit"], port=24)
+    assert "NOT sent" in res2 and net2.sent == [], res2
+    print("login-prompt guard: OK")
 
 
 def check_transfer_file() -> None:
@@ -777,6 +841,7 @@ async def main() -> None:
     check_dialect_hint()
     check_execute_footer()
     check_session_terminated()
+    check_login_prompt_guard()
     check_configure()
     check_run_commands()
     check_transfer_file()

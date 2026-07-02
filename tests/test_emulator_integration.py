@@ -162,15 +162,16 @@ def test_configure_reports_submode_on_the_wire(manager, make_switch):
 def test_get_help_parses_options(manager, make_switch):
     """A real ``?`` round-trip returns the device help, parsed into option tokens.
 
-    (We assert on the parsed options - the feature under test - rather than the
-    footer's session label, which on a just-connected device still has the login
-    banner inside its recent-console window.)
+    The footer's ``now:`` label must fall back to the base prompt captured before
+    the '?' was sent - the post-help console tail (prompt + prefix + backspaces)
+    is not classifiable on its own and used to surface as ``unknown``.
     """
     sw = make_switch()
     _connect(manager, sw)
     out = manager.get_help(HOST, "show ", port=sw.port)
     assert "interface" in out and "ip" in out
     assert "[device-mcp] options: interface, ip" in out
+    assert "now: Switch# (enable)" in out, out
 
 
 def test_get_help_custom_listing(manager, make_switch):
@@ -352,6 +353,102 @@ def test_auto_relogin_after_exit_logout(manager, make_switch):
     out = manager.execute_command(HOST, "show clock", port=sw.port)
     assert "12:00:00" in out, out
     assert out.rstrip().endswith("Switch#"), out  # back at the enable prompt
+
+
+def test_command_refused_at_login_prompt(manager, make_switch):
+    """After a logout, a command is refused - never typed into the Username field.
+
+    This is the high-severity real-hardware bug: 'Username: show vlan' followed by
+    '%SYS-5-AUTH: User show vlan Authorization failed'. Without auto_relogin the
+    command must not reach the wire at all, and the footer must say what to do.
+    """
+    sw = make_switch(responses={"show clock": "12:00:00"})
+    _connect(manager, sw)  # auto_relogin defaults off at the manager layer
+    manager.execute_command(HOST, "exit", port=sw.port)        # enable -> user
+    out = manager.execute_command(HOST, "exit", port=sw.port)  # user -> logged out
+    assert "now: awaiting_login" in out, out
+
+    seen = list(sw.commands_seen)
+    out = manager.execute_command(HOST, "show clock", port=sw.port)
+    assert "NOT sent" in out and "relogin_device" in out, out
+    assert "now: awaiting_login" in out, out
+    assert sw.commands_seen == seen, sw.commands_seen  # nothing reached the device
+
+    # relogin_device then recovers on the same socket and the command runs. (If the
+    # refused command HAD been typed into the Username field, this login would fail.)
+    relog = manager.relogin(HOST, port=sw.port)
+    assert "re-logged in" in relog, relog
+    out = manager.execute_command(HOST, "show clock", port=sw.port)
+    assert "12:00:00" in out, out
+
+
+def test_auto_relogin_failure_is_surfaced(manager, make_switch):
+    """If auto-relogin cannot get back in, say so - and never type the command."""
+    sw = make_switch()
+    _connect(manager, sw, auto_relogin=True)
+    manager.execute_command(HOST, "exit", port=sw.port)
+    out = manager.execute_command(HOST, "exit", port=sw.port)  # logged out
+    assert "now: awaiting_login" in out, out
+    sw.password = "rotated"  # the stored credentials are now wrong
+    out = manager.execute_command(HOST, "show clock", port=sw.port)
+    assert "auto-relogin failed" in out, out
+    assert "NOT sent" in out, out
+
+
+def test_relogin_noop_when_already_logged_in(manager, make_switch):
+    """relogin at a live prompt types nothing - credentials would run as commands."""
+    sw = make_switch()
+    _connect(manager, sw)
+    seen = list(sw.commands_seen)
+    out = manager.relogin(HOST, port=sw.port)
+    assert "already logged in" in out, out
+    assert "now: Switch# (enable)" in out, out
+    # 'admin' was never executed as a command on the device.
+    assert sw.commands_seen == seen, sw.commands_seen
+
+
+def test_configure_rejected_line_reports_partial_and_exits(manager, make_switch):
+    """A rejected config line: honest footer, and config mode is exited, not stranded."""
+    sw = make_switch(responses={"name KEEP_ME": ""})
+    _connect(manager, sw)
+    out = manager.configure(
+        HOST, ["vlan 98", "name KEEP_ME", "bogus-command-xyz", "exit"], port=sw.port
+    )
+    assert "FAILED" in out and "bogus-command-xyz" in out, out
+    assert "remain in effect" in out, out          # honest about the partial apply
+    assert "now: Switch# (enable)" in out, out     # pulled back out of config mode
+    # The lines before the rejected one really were sent to the device.
+    assert "vlan 98" in sw.commands_seen and "name KEEP_ME" in sw.commands_seen
+
+
+def test_expect_regex_timeout_returns_real_output(manager, make_switch, monkeypatch):
+    """A confirm pattern that never appears must not swallow the device's reply.
+
+    Real-hardware repro: 'delete flash:no-such-file.txt' with expect_regex='(y/n)'
+    errors immediately and returns to the prompt, but only a bare ReadTimeout came
+    back. The real output (already in the console ring) must be returned instead.
+    """
+    import device_mcp.connection as conn_mod
+    monkeypatch.setattr(conn_mod, "_EXEC_READ_TIMEOUT", 3.0)
+    sw = make_switch(responses={
+        "delete no-such-file.txt": "the deleting file name is invalid!",
+    })
+    _connect(manager, sw)
+    out = manager.execute_command(HOST, "delete no-such-file.txt", mode="enable",
+                                  expect_regex=r"\(y/n\)", answer="y", port=sw.port)
+    assert "deleting file name is invalid" in out, out
+    assert "never matched" in out, out
+    assert "now: Switch# (enable)" in out, out
+    assert "ReadTimeout" not in out, out
+
+
+def test_read_console_stream_reports_empty_timeout(manager, make_switch):
+    """An empty stream read says so instead of returning a bare empty string."""
+    sw = make_switch()
+    _connect(manager, sw)
+    out = manager.read_console_stream(HOST, timeout=1.0, port=sw.port)
+    assert "no output within 1s" in out, out
+    assert "now: Switch# (enable)" in out, out
 
 
 # ----------------------------------------------------------------- dialect

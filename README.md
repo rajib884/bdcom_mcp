@@ -20,7 +20,7 @@ platform.
 - **🎯 Universal Command Execution**: Execute any device command through a single interface
 - **🔐 Mode Management**: `raw` default drives the channel directly at the live prompt; `auto` runs at the current privilege level without downgrading; `user`/`enable`/`config` force a level
 - **🧾 Self-describing results**: every command returns its raw output plus a `[device-mcp]` footer reporting device errors (vs transport failures) and where the CLI ended up — see [Result footer](#-result-footer)
-- **🧱 One-or-many commands**: `execute_command` takes a command **list**; `mode=config` applies it as an atomic block (sub-mode nesting handled, exact failing line reported), other modes run them in order
+- **🧱 One-or-many commands**: `execute_command` takes a command **list**; `mode=config` applies it as one config block (sub-mode nesting handled; a rejected line stops the block and is reported — lines already applied stay), other modes run them in order
 - **🌐 Multi-Device Support**: Manage many devices at once — including several behind **one IP on different ports** (console/terminal servers), addressed as `host:port`
 - **✅ Interactive Confirmations**: Answer `(y/n)` / `[confirm]` prompts (e.g. `reboot`, `delete startup-config`) via `expect_regex` + `answer`
 - **📜 Console Diagnostics & audit logs**: live raw-I/O history (`get_console_history`) plus an always-on per-connection log file under `./logs` (`DEVICE_MCP_LOG_DIR` to relocate) capturing the full session for later audit
@@ -134,11 +134,12 @@ the CLI ended up (see [Result footer](#-result-footer)).
 - `mode` (optional): `raw` (default), `auto`, `user`, `enable`, or `config`.
   - `auto` runs at the current privilege level **without downgrading** (so `show`
     works on BDCOM, which connects in enable); `user`/`enable` force that level.
-  - **`config`** applies the whole list as one **atomic** config block (enters/exits
-    config mode, handles sub-mode prompts like `Switch_config_vlan30#`); a rejected
-    line is reported with which one failed and where the session was left — no
-    partial config applied silently. Send a sub-mode `exit` as its own list item
-    when moving between contexts.
+  - **`config`** applies the whole list as one config block (enters/exits config
+    mode, handles sub-mode prompts like `Switch_config_vlan30#`). A rejected line
+    stops the block and the footer reports which one failed; lines **before** it
+    are already applied and stay applied (no rollback), and config mode is exited
+    so the session isn't left stranded. Send a sub-mode `exit` as its own list
+    item when moving between contexts.
   - **`raw`** (the default) bypasses mode switching and prompt detection, driving
     the channel directly — needed at prompts netmiko doesn't know, notably the
     bootloader `monitor#` shell (where a normal `reboot` waits for the device's
@@ -147,6 +148,13 @@ the CLI ended up (see [Result footer](#-result-footer)).
   only when a single command is given)
 - `answer` (optional): Reply to send when `expect_regex` matches
 - `port` (optional): Required only when several devices share an IP
+
+If the session is sitting at a **login prompt** (idle logout, reboot), the command
+is **not** typed into the `Username:` field: with `auto_relogin` (the connect
+default) one re-login attempt is made first, otherwise the footer says to call
+`relogin_device`. And if `expect_regex` never matches but the device is back at a
+prompt, the real output is returned with a `never matched` note instead of a bare
+`ReadTimeout`.
 
 **Example (single show):**
 ```json
@@ -181,6 +189,18 @@ the CLI ended up (see [Result footer](#-result-footer)).
 To reboot from the bootloader `monitor#` shell, use the same call with `"mode":
 "raw"`.
 
+#### `relogin_device`
+Re-authenticate on the **same socket** after the device dropped to its login prompt
+(idle logout, reboot) — no disconnect/reconnect needed. Credentials default to the
+ones given at connect. The channel is drained until quiet and a bare RETURN provokes
+a fresh prompt first (this rides out post-reboot console churn and BDCOM's
+`Press RETURN to get started`), with one internal retry; if the session is actually
+still logged in, nothing is typed (credentials at a live prompt would run as
+commands) and the footer reports `already logged in`.
+
+**Parameters:** `host` (required), `username` / `password` (optional overrides,
+e.g. for a recovery connect opened without credentials), `port` (optional).
+
 #### `disconnect_device`
 Disconnect from a device.
 
@@ -204,7 +224,10 @@ auditing logins, prompt-matching failures, and reboots.
 #### `read_console_stream`
 Read live console output **without sending a command** — accumulates whatever the
 device emits until a pattern matches or the timeout elapses. Handy for watching a
-device reboot back to its login prompt.
+device reboot back to its login prompt. A read that saw nothing returns a
+`no output within Ns` footer (so "no data" isn't mistaken for a failure). Only
+bytes arriving **during** the call are returned; output emitted between tool calls
+goes to the console history — use `get_console_history` for that backlog.
 
 **Parameters:** `host` (required), `expect_pattern` (optional regex),
 `timeout` (optional seconds, default 10, capped at 120), `port` (optional).
@@ -291,8 +314,10 @@ session state:
   when it prints a `^` caret); distinct from a **FAILED** transport error.
 - **SESSION_TERMINATED** — the device dropped the session back to a login prompt
   (e.g. an idle logout, or `write memory` which BDCOM treats as a forced logout);
-  `disconnect_device` then `connect_device` to recover. Reported instead of a raw
-  `ReadTimeout`, so a desync is immediately obvious.
+  recover with `relogin_device` (same socket) or `disconnect_device` +
+  `connect_device`. Reported instead of a raw `ReadTimeout`, so a desync is
+  immediately obvious. While the session sits at that login prompt, commands are
+  refused rather than typed into the `Username:` field.
 - **hint** — for a known Cisco→BDCOM gotcha (see the cheat-sheet below) the footer
   appends the right command to use; shown on a device error or `SESSION_TERMINATED`.
 - **now** — the live prompt plus a **parsed mode label** (never raw read-buffer
@@ -397,7 +422,8 @@ driver instead enters enable mode and disables paging there.
   (and `get_console_history`) as sensitive.
 - If a session ever desyncs, `disconnect_device` then `connect_device` for a clean
   one rather than retrying the failing command. The footer now says
-  `SESSION_TERMINATED` when the device has dropped you to a login prompt.
+  `SESSION_TERMINATED` when the device has dropped you to a login prompt; after a
+  plain idle logout, `relogin_device` re-authenticates on the same socket instead.
 - **Firmware:** use `upgrade_firmware` for a healthy unit; for one that can't boot
   far enough, `recover_firmware` enters the bootloader `monitor#` shell (reboot via
   the hidden boot menu — Ctrl-] then the reboot option — then a Ctrl-P burst after
@@ -526,11 +552,19 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 `mode` 默认 `raw`（直接驱动通道、在当前提示符下执行，用于 netmiko 不认识的提示符，如引导
 加载器 `monitor#`，普通 `reboot` 会一直等待 `Switch.*` 提示符而发不出去）；`auto` 在当前
 权限级别执行、不降级（BDCOM 连接后处于 enable，`show` 可直接工作），也可强制
-`user`/`enable`；**`config`** 将整个列表作为一个原子配置块下发（自动进出配置模式、
-处理子模式提示符；某条被拒绝时 footer 指出是哪一条且不会留下半套配置）。
+`user`/`enable`；**`config`** 将整个列表作为一个配置块下发（自动进出配置模式、处理子模式
+提示符）；某条被拒绝时该块停止执行，footer 指出是哪一条——**之前的行已生效且不会回滚**，
+并自动退出配置模式以免会话滞留在子模式。
 返回每条命令的原始输出加一行 `[device-mcp]` footer。支持
 `expect_regex` + `answer` 应答交互式 `(y/n)` 确认（仅单条命令时生效）；`port` 仅在同一 IP
-有多台设备时需要。
+有多台设备时需要。若会话停在登录提示符，命令**不会**被输入到 `Username:` 字段：默认先尝试
+自动重新登录，否则 footer 提示调用 `relogin_device`。
+
+#### `relogin_device`
+设备因空闲超时/重启回到登录提示符后，在**同一连接**上重新认证（无需断开重连）。凭据默认
+沿用连接时提供的。会先等通道安静并发送回车唤出新的提示符（可跨过启动期刷屏和
+`Press RETURN to get started`），内部重试一次；若会话其实仍在登录状态，则不输入任何内容并
+报告 `already logged in`。
 
 #### `disconnect_device`
 断开与设备的连接（同一 IP 多设备时需指定 `port`）。

@@ -126,8 +126,9 @@ def execute_command(
         Field(
             description='One or more commands to run, in order. A single command is a '
             'one-item list, e.g. ["show version"]. With mode="config" the whole list '
-            "is applied as one atomic config block (config mode entered/exited "
-            "automatically; send a sub-mode 'exit' as its own item between contexts, "
+            "is applied as one config block (config mode entered/exited "
+            "automatically; a rejected line stops the block and earlier lines stay "
+            "applied; send a sub-mode 'exit' as its own item between contexts, "
             'e.g. ["vlan 30", "exit", "interface GigaEthernet0/1", "switchport mode '
             'access", "exit"]); in other modes the commands run sequentially.'
         ),
@@ -140,7 +141,8 @@ def execute_command(
             "bootloader monitor# shell, where a normal command would wait for the "
             "device's usual 'Switch.*' prompt and never be sent). auto runs at the "
             "current privilege level without downgrading; user/enable/config force "
-            "that level (config applies the list as one atomic block)."
+            "that level (config applies the list as one block, stopping at the "
+            "first rejected line)."
         ),
     ] = "raw",
     expect_regex: Annotated[
@@ -160,8 +162,11 @@ def execute_command(
     The device must be connected first using ``connect_device``. Returns each
     command's raw output followed by a ``[device-mcp]`` footer reporting any device
     error (vs a transport failure) and where the CLI ended up (prompt + mode). With
-    ``mode="config"`` the whole list is applied atomically and a rejected line is
-    reported without leaving a partial config. To reboot from the ``monitor#`` shell,
+    ``mode="config"`` the list is applied as one config block; a rejected line stops
+    the block and is reported - lines before it are already applied (no rollback).
+    If the session is sitting at a login prompt the command is NOT typed: one
+    auto-relogin attempt is made first (when enabled at connect), otherwise the
+    footer says to call ``relogin_device``. To reboot from the ``monitor#`` shell,
     pass ``mode="raw"`` with ``expect_regex="\\(y/n\\)"`` and ``answer="y"``.
     """
     try:
@@ -204,8 +209,12 @@ def relogin_device(
     When a device times out and drops back to its ``Username:`` prompt, the socket is
     still open. This re-sends credentials on the live channel instead of forcing a
     disconnect + reconnect. Credentials default to the ones used at connect; pass them
-    explicitly for a connection opened without any (e.g. a recovery connect). Returns a
-    ``[device-mcp]`` footer reporting where the CLI ended up.
+    explicitly for a connection opened without any (e.g. a recovery connect). The
+    channel is drained until quiet and a bare RETURN provokes a fresh prompt first
+    (handles post-reboot console churn and 'Press RETURN to get started'), with one
+    internal retry; if the session is actually still logged in, nothing is typed and
+    the footer reports ``already logged in``. Returns a ``[device-mcp]`` footer
+    reporting where the CLI ended up.
     """
     try:
         return _manager.relogin(host, username, password, port)
